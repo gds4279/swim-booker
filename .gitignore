@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Mac system file
+.DS_Store
+
+# VS Code settings
+.vscode/
+
+# Environment variables
+.env
+secrets.py
+config.py
+*.key
+*.pem
