@@ -19,3 +19,7 @@ secrets.py
 config.py
 *.key
 *.pem
+
+# Runtime artifacts
+swim_booker.log
+*.png

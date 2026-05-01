@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import smtplib
+import time
 import traceback
 from datetime import date, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -33,6 +34,8 @@ EVENT_NAME = "Indoor Lap Pool Reservations"
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
 SCREENSHOT_FILE = BASE_DIR / "failure_screenshot.png"
+MAX_ATTEMPTS = 5
+RETRY_DELAY = 10  # seconds between attempts
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -77,6 +80,10 @@ def send_email(subject: str, body: str, attachment_path: Path | None = None) -> 
         log.error("Failed to send email:\n%s", traceback.format_exc())
 
 
+class BookingError(Exception):
+    pass
+
+
 def fail(page, reason: str) -> None:
     log.error("FAILED: %s", reason)
     try:
@@ -84,18 +91,13 @@ def fail(page, reason: str) -> None:
         log.info("Screenshot saved to %s", SCREENSHOT_FILE)
     except Exception:
         pass
-    send_email(
-        subject=f"[Swim Booker] FAILED – {reason[:60]}",
-        body=f"Swim lane booking failed.\n\nReason: {reason}\n\n{traceback.format_exc()}",
-        attachment_path=SCREENSHOT_FILE,
-    )
-    sys.exit(1)
+    raise BookingError(reason)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def book_once() -> None:
     target_date = date.today() + timedelta(days=1)
     day_name = target_date.strftime("%A")   # e.g. "Saturday"
     log.info("Booking %s %s slot for %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
@@ -198,7 +200,7 @@ def main() -> None:
         log.info("Looking for %s slot", TARGET_TIME)
 
         # Look for a register/book button near the "8:00 AM" / "8:00am" text
-        time_variants = ["8:00 AM", "8:00am", "8:00 am", "8AM", "8 AM"]
+        time_variants = ["8:00 AM", "8:00am", "8:00 am", "8:00AM"]
         register_btn = None
 
         for variant in time_variants:
@@ -241,7 +243,105 @@ def main() -> None:
         page.wait_for_load_state("networkidle")
 
         # ------------------------------------------------------------------
-        # 5. Confirm if a confirmation dialog/button appears
+        # 5. Handle ticket selection wizard (1.Tickets → 2.Payments → 3.Confirmation)
+        # ------------------------------------------------------------------
+        # Target Gary's specific member row (not the whole form, not Dawn's row)
+        gary_row = page.locator("li.event-registration__members-row").filter(has_text="Gary").first
+        if gary_row.count() > 0:
+            log.info("Ticket selection step detected – targeting Gary's member row")
+            target_norm = TARGET_TIME.lower().replace(" ", "")
+            gary_select = gary_row.locator("select").first
+            if gary_select.count() > 0:
+                options = gary_select.evaluate(
+                    "el => [...el.options].map(o => ({value: o.value, text: o.text, disabled: o.disabled}))"
+                )
+                log.info("Gary's ticket options: %s", options)
+                matched = [o["value"] for o in options if not o["disabled"] and target_norm in o["text"].lower().replace(" ", "")]
+                if not matched:
+                    matched = [o["value"] for o in options if not o["disabled"] and o["value"] and o["value"] != "0"]
+                if matched:
+                    selected_value = matched[0]
+                    log.info("Selecting Gary's slot: %s", selected_value)
+                    try:
+                        gary_select.select_option(value=selected_value, timeout=5000)
+                        log.info("Selected via Playwright select_option")
+                    except Exception as e:
+                        log.warning("select_option failed (%s) – trying JS setter", e)
+                    # Re-trigger React's change event so its state updates
+                    gary_select.evaluate(
+                        "(el, val) => { const s = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; s.call(el,val); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }",
+                        selected_value,
+                    )
+                else:
+                    log.warning("No available time slot found for %s in Gary's options", TARGET_TIME)
+
+            next_btn = page.locator(
+                "#continue-button, button:has-text('Continue'), button:has-text('Next'), "
+                "a:has-text('Next'), a:has-text('Continue')"
+            ).first
+            if next_btn.count() > 0:
+                log.info("Waiting for Continue to enable after slot selection")
+                try:
+                    next_btn.wait_for(state="enabled", timeout=15000)
+                    log.info("Continue enabled – clicking")
+                    next_btn.click()
+                except Exception:
+                    log.warning("Continue still disabled – force-clicking via JS")
+                    next_btn.evaluate(
+                        "el => { el.disabled = false; el.classList.remove('cta--disabled'); el.click(); }"
+                    )
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(1500)
+
+        # ------------------------------------------------------------------
+        # 6. Handle payments/agreement step if present (step 2 of wizard)
+        # ------------------------------------------------------------------
+        agree_cb = page.locator("input[type='checkbox']").first
+        if agree_cb.count() > 0:
+            log.info("Payment agreement step detected – checking 'I Agree' via React props")
+            # Call React's onChange directly via __reactProps (React 17+), falling back to native events.
+            # Do NOT dispatch 'click' — that would toggle the checkbox back to unchecked.
+            cb_result = agree_cb.evaluate("""el => {
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
+                setter.call(el, true);
+                const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps'));
+                if (propsKey && el[propsKey].onChange) {
+                    el[propsKey].onChange({target: el, currentTarget: el, type: 'change', bubbles: true,
+                                          preventDefault: () => {}, stopPropagation: () => {}});
+                    return 'react_props';
+                }
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                return 'native_events';
+            }""")
+            page.wait_for_timeout(1500)
+
+            # Use the LAST visible Continue button — step 2's button comes after step 1's in the DOM
+            pay_btn = page.locator("button:has-text('Continue'), #continue-button, a:has-text('Continue')").last
+            if pay_btn.count() > 0:
+                log.info("Waiting for Continue button to enable after checkbox check")
+                try:
+                    pay_btn.wait_for(state="enabled", timeout=15000)
+                    log.info("Continue button enabled – clicking naturally")
+                    pay_btn.scroll_into_view_if_needed()
+                    pay_btn.click()
+                except Exception:
+                    log.warning("Continue still disabled – force-clicking last Continue button")
+                    pay_btn.evaluate("""el => {
+                        el.disabled = false;
+                        el.classList.remove('cta--disabled');
+                        const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps'));
+                        if (propsKey && el[propsKey].onClick) {
+                            el[propsKey].onClick({target: el, preventDefault: () => {}, stopPropagation: () => {}});
+                        } else {
+                            el.click();
+                        }
+                    }""")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(2000)
+
+        # ------------------------------------------------------------------
+        # 7. Confirm if a confirmation dialog/button appears
         # ------------------------------------------------------------------
         confirm_btn = page.locator(
             "button:has-text('Confirm'), button:has-text('Yes'), "
@@ -253,15 +353,21 @@ def main() -> None:
             page.wait_for_load_state("networkidle")
 
         # ------------------------------------------------------------------
-        # 6. Verify success
+        # 8. Verify success
         # ------------------------------------------------------------------
+        page.wait_for_timeout(2000)
         page_text = page.inner_text("body").lower()
-        success_indicators = ["registered", "confirmed", "success", "thank you", "you are registered"]
-        if not any(kw in page_text for kw in success_indicators):
-            fail(page, "Registration submitted but no success confirmation found on page")
+        log.info("Final page URL: %s", page.url)
+        # Fail if we're still on step 2 (has step 2 specific text) or no step 3 success text found
+        still_on_step2 = "this is confirmation you will pay" in page_text
+        success_indicators = ["success! you're going", "you are registered", "ticket purchased",
+                              "thank you", "booking confirmed", "you have been registered"]
+        if still_on_step2 or not any(kw in page_text for kw in success_indicators):
+            fail(page, f"Not on confirmation page (still_on_step2={still_on_step2})")
 
         log.info("SUCCESS – registered for %s %s on %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
 
+        page.screenshot(path=str(SCREENSHOT_FILE))
         browser.close()
 
     send_email(
@@ -272,18 +378,36 @@ def main() -> None:
             f"Date:   {target_date.strftime('%A, %B %-d, %Y')}\n"
             f"Time:   {TARGET_TIME}\n"
         ),
+        attachment_path=SCREENSHOT_FILE,
     )
 
 
+def main() -> None:
+    last_exc: BaseException | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            log.info("Attempt %d/%d", attempt, MAX_ATTEMPTS)
+            book_once()
+            return
+        except (BookingError, Exception) as exc:
+            last_exc = exc
+            log.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, exc)
+            if attempt < MAX_ATTEMPTS:
+                log.info("Retrying in %d seconds…", RETRY_DELAY)
+                time.sleep(RETRY_DELAY)
+
+    reason = str(last_exc) if last_exc else "unknown error"
+    log.error("All %d attempts failed", MAX_ATTEMPTS)
+    send_email(
+        subject=f"[Swim Booker] FAILED – {reason[:60]}",
+        body=(
+            f"Swim lane booking failed after {MAX_ATTEMPTS} attempts.\n\n"
+            f"Last error: {reason}\n\n{traceback.format_exc()}"
+        ),
+        attachment_path=SCREENSHOT_FILE,
+    )
+    sys.exit(1)
+
+
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception:
-        log.critical("Unhandled exception:\n%s", traceback.format_exc())
-        send_email(
-            subject="[Swim Booker] FAILED – unhandled exception",
-            body=traceback.format_exc(),
-        )
-        sys.exit(1)
+    main()

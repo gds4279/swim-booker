@@ -1,128 +1,98 @@
 # Swim Booker
 
-An automated script to book swim lanes at MyTrilogyLife.com for the next day's 8 AM slot.
+Automated script to book the 8:00 AM indoor lap pool lane at MyTrilogyLife.com for the next day.
 
-## Description
+## How It Works
 
-This Python application uses Playwright to automate the process of logging into MyTrilogyLife.com, navigating to the events page, and booking an indoor lap pool reservation for the following day's 8:00 AM time slot. It includes email notifications for success or failure, logging, and error handling with screenshots.
+1. Logs into MyTrilogyLife.com using stored credentials
+2. Navigates to the Events page and finds the "Indoor Lap Pool Reservations" event for tomorrow
+3. Clicks Register, selects the 8:00 AM slot for Gary's member row
+4. Completes the 3-step wizard (Tickets → Payments → Confirmation)
+5. Verifies the confirmation page was reached
+6. Sends an email with the result and a screenshot
 
-## Features
+Runs automatically at **7:59 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
 
-- Automated login and booking
-- Email notifications (success/failure)
-- Comprehensive logging
-- Screenshot capture on failures
-- Environment variable configuration for security
-- Headless browser operation
+## Setup
 
-## Prerequisites
+### Prerequisites
 
-- Python 3.8 or higher
-- Git
-- A Gmail account for email notifications (or modify SMTP settings)
+- Python 3.8+
+- A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833) for notifications
 
-## Installation
+### Install
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/gds4279/swim-booker.git
-   cd swim-booker
-   ```
+```bash
+git clone https://github.com/gds4279/swim-booker.git
+cd swim-booker
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+```
 
-2. Create a virtual environment:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
+### Configure
 
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Install Playwright browsers:
-   ```bash
-   playwright install
-   ```
-
-## Configuration
-
-Create a `.env` file in the project root with the following variables:
+Create a `.env` file in the project root:
 
 ```env
 MYTRILOGY_USERNAME=your_username
 MYTRILOGY_PASSWORD=your_password
 SMTP_USER=your_gmail@gmail.com
-SMTP_APP_PASSWORD=your_app_password
-NOTIFY_EMAIL=notification_email@gmail.com  # Optional, defaults to SMTP_USER
+SMTP_APP_PASSWORD=your_gmail_app_password
+NOTIFY_EMAIL=notification_email@gmail.com  # optional, defaults to SMTP_USER
 ```
-
-### Getting a Gmail App Password
-
-1. Go to your Google Account settings
-2. Enable 2-Factor Authentication
-3. Generate an App Password for "Mail"
-4. Use this password in the `SMTP_APP_PASSWORD` variable
 
 ## Usage
 
-Run the script:
+Run manually:
 
 ```bash
-python book_swim.py
-```
-
-Or use the provided shell script:
-
-```bash
+python3 book_swim.py
+# or
 ./run.sh
 ```
 
-The script will:
-1. Attempt to book the 8 AM slot for tomorrow
-2. Send an email notification with the result
-3. Log all actions to `swim_booker.log`
+The cron schedule (`crontab -e`) is:
 
-## How It Works
+```
+59 19 * * 5,6 /home/gary/projects/swim-booker/run.sh
+```
 
-1. **Login**: Navigates to the login page and authenticates using provided credentials
-2. **Navigate to Events**: Goes to the events page
-3. **Find Event**: Searches for the "Indoor Lap Pool Reservations" event for the next day
-4. **Book Slot**: Locates and clicks the 8:00 AM booking button
-5. **Confirm**: Handles any confirmation dialogs
-6. **Verify**: Checks for success indicators on the page
-7. **Notify**: Sends email with results
+This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday).
 
 ## Files
 
-- `book_swim.py`: Main application script
-- `requirements.txt`: Python dependencies
-- `run.sh`: Shell script to run the application
-- `.gitignore`: Excludes sensitive files and virtual environments
-- `swim_booker.log`: Application logs
-- `failure_screenshot.png`: Screenshot captured on booking failure
+| File | Purpose |
+|------|---------|
+| `book_swim.py` | Main script |
+| `run.sh` | Shell wrapper (used by cron) |
+| `requirements.txt` | Python dependencies |
+| `.env` | Credentials (not committed) |
+| `swim_booker.log` | Rolling log of all runs |
+| `failure_screenshot.png` | Screenshot captured on failure or success confirmation |
+| `debug_after_payment_continue.png` | Debug screenshot after the payments wizard step |
+
+## Configuration
+
+Key constants at the top of `book_swim.py`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TARGET_TIME` | `"8:00 AM"` | Time slot to book |
+| `EVENT_NAME` | `"Indoor Lap Pool Reservations"` | Event to search for |
+| `MAX_ATTEMPTS` | `5` | Retry attempts before giving up |
+| `RETRY_DELAY` | `10` | Seconds between retries |
 
 ## Troubleshooting
 
-- **Login Issues**: Verify credentials in `.env`
-- **Booking Fails**: Check `swim_booker.log` and `failure_screenshot.png`
-- **Email Not Sent**: Confirm SMTP settings and app password
-- **Dependencies**: Ensure all packages are installed and Playwright browsers are set up
+- **Wrong slot booked**: Verify `TARGET_TIME` in `book_swim.py`
+- **Login fails**: Check credentials in `.env`
+- **Booking fails**: Review `swim_booker.log` and `failure_screenshot.png`
+- **Email not sent**: Confirm `SMTP_APP_PASSWORD` is a Gmail App Password, not your login password
+- **All slots disabled**: The 8 AM slot may already be taken; script falls back to the next available slot
 
-## Security Notes
+## Security
 
-- Never commit `.env` files to version control
-- Use strong, unique passwords
-- Consider using a dedicated email account for notifications
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## License
-
-This project is for personal use. Please respect the terms of service of MyTrilogyLife.com.
+- Never commit `.env` to version control (it's in `.gitignore`)
+- Use a Gmail App Password, not your account password
