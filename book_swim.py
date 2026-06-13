@@ -1,9 +1,12 @@
+import json
 import os
+import re
 import sys
 import logging
 import smtplib
 import time
 import traceback
+import urllib.request
 from datetime import date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -26,6 +29,8 @@ PASSWORD = os.environ["MYTRILOGY_PASSWORD"]
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_APP_PASSWORD = os.environ["SMTP_APP_PASSWORD"]
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", SMTP_USER)
+CC_EMAIL = "dbutler06@comcast.net"
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 LOGIN_URL = "https://www.mytrilogylife.com"
 EVENTS_URL = "https://members.mytrilogylife.com/events"
@@ -59,6 +64,7 @@ def send_email(subject: str, body: str, attachment_path: Path | None = None) -> 
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
+    msg["Cc"] = CC_EMAIL
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
@@ -74,10 +80,26 @@ def send_email(subject: str, body: str, attachment_path: Path | None = None) -> 
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_APP_PASSWORD)
-            server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+            server.sendmail(SMTP_USER, [NOTIFY_EMAIL, CC_EMAIL], msg.as_string())
         log.info("Email sent: %s", subject)
     except Exception:
         log.error("Failed to send email:\n%s", traceback.format_exc())
+
+
+def send_slack(message: str) -> None:
+    if not SLACK_WEBHOOK_URL:
+        return
+    payload = json.dumps({"text": message}).encode()
+    req = urllib.request.Request(
+        SLACK_WEBHOOK_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        log.info("Slack notification sent")
+    except Exception:
+        log.error("Failed to send Slack notification:\n%s", traceback.format_exc())
 
 
 class BookingError(Exception):
@@ -380,6 +402,25 @@ def book_once() -> None:
         ),
         attachment_path=SCREENSHOT_FILE,
     )
+    send_slack(
+        f":white_check_mark: *Swim lane booked!* {day_name} {TARGET_TIME} — {target_date.strftime('%A, %B %-d, %Y')}"
+    )
+
+
+def trim_log() -> None:
+    if not LOG_FILE.exists():
+        return
+    cutoff = date.today() - timedelta(days=30)
+    lines = LOG_FILE.read_text().splitlines(keepends=True)
+    kept = []
+    keep_block = False
+    for line in lines:
+        m = re.match(r'^(\d{4}-\d{2}-\d{2})', line)
+        if m:
+            keep_block = date.fromisoformat(m.group(1)) >= cutoff
+        if keep_block:
+            kept.append(line)
+    LOG_FILE.write_text("".join(kept))
 
 
 def main() -> None:
@@ -388,6 +429,7 @@ def main() -> None:
         try:
             log.info("Attempt %d/%d", attempt, MAX_ATTEMPTS)
             book_once()
+            trim_log()
             return
         except (BookingError, Exception) as exc:
             last_exc = exc
@@ -406,6 +448,8 @@ def main() -> None:
         ),
         attachment_path=SCREENSHOT_FILE,
     )
+    send_slack(f":x: *Swim booking FAILED* after {MAX_ATTEMPTS} attempts — {reason[:120]}")
+    trim_log()
     sys.exit(1)
 
 

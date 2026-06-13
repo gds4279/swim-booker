@@ -9,9 +9,10 @@ Automated script to book the 8:00 AM indoor lap pool lane at MyTrilogyLife.com f
 3. Clicks Register, selects the 8:00 AM slot for Gary's member row
 4. Completes the 3-step wizard (Tickets → Payments → Confirmation)
 5. Verifies the confirmation page was reached
-6. Sends an email with the result and a screenshot
+6. Sends an email (with CC) and a Slack notification with the result and a screenshot
+7. Prunes log entries older than 30 days
 
-Runs automatically at **7:59 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
+Runs automatically at **7:59:45 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
 
 ## Setup
 
@@ -19,6 +20,7 @@ Runs automatically at **7:59 AM every Friday and Saturday** via cron, booking th
 
 - Python 3.8+
 - A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833) for notifications
+- A Slack Incoming Webhook URL for the target channel
 
 ### Install
 
@@ -41,6 +43,7 @@ MYTRILOGY_PASSWORD=your_password
 SMTP_USER=your_gmail@gmail.com
 SMTP_APP_PASSWORD=your_gmail_app_password
 NOTIFY_EMAIL=notification_email@gmail.com  # optional, defaults to SMTP_USER
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 ## Usage
@@ -56,22 +59,28 @@ python3 book_swim.py
 The cron schedule (`crontab -e`) is:
 
 ```
-59 19 * * 5,6 /home/gary/projects/swim-booker/run.sh
+59 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
 ```
 
-This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday).
+This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` includes a `sleep 45` so the script effectively starts at **7:59:45 AM**.
+
+## Notifications
+
+On every run (success or failure) the script sends:
+
+- **Email** — to `NOTIFY_EMAIL`, CC'd to `dbutler06@comcast.net`, with a screenshot attached
+- **Slack** — a message to the configured webhook channel
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `book_swim.py` | Main script |
-| `run.sh` | Shell wrapper (used by cron) |
+| `run.sh` | Shell wrapper (used by cron, includes 45-second delay) |
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (not committed) |
-| `swim_booker.log` | Rolling log of all runs |
+| `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
 | `failure_screenshot.png` | Screenshot captured on failure or success confirmation |
-| `debug_after_payment_continue.png` | Debug screenshot after the payments wizard step |
 
 ## Configuration
 
@@ -90,6 +99,7 @@ Key constants at the top of `book_swim.py`:
 - **Login fails**: Check credentials in `.env`
 - **Booking fails**: Review `swim_booker.log` and `failure_screenshot.png`
 - **Email not sent**: Confirm `SMTP_APP_PASSWORD` is a Gmail App Password, not your login password
+- **Slack not posting**: Confirm `SLACK_WEBHOOK_URL` is set in `.env` and the webhook is active
 - **All slots disabled**: The 8 AM slot may already be taken; script falls back to the next available slot
 
 ## Security
