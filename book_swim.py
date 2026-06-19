@@ -122,6 +122,7 @@ def fail(page, reason: str) -> None:
 def book_once() -> None:
     target_date = date.today() + timedelta(days=1)
     day_name = target_date.strftime("%A")   # e.g. "Saturday"
+    booked_slot_text = TARGET_TIME  # updated to actual slot text if a specific option is selected
     log.info("Booking %s %s slot for %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
 
     with sync_playwright() as p:
@@ -288,7 +289,9 @@ def book_once() -> None:
                     matched = [o["value"] for o in options if not o["disabled"] and o["value"] and o["value"] != "0"]
                 if matched:
                     selected_value = matched[0]
-                    log.info("Selecting Gary's slot: %s", selected_value)
+                    raw_text = next((o["text"] for o in options if o["value"] == selected_value), TARGET_TIME)
+                    booked_slot_text = raw_text.split(" Indoor")[0].strip()
+                    log.info("Selecting Gary's slot: %s (%s)", selected_value, booked_slot_text)
                     try:
                         gary_select.select_option(value=selected_value, timeout=5000)
                         log.info("Selected via Playwright select_option")
@@ -398,17 +401,17 @@ def book_once() -> None:
         browser.close()
 
     send_email(
-        subject=f"[Swim Booker] SUCCESS – {day_name} {TARGET_TIME} booked",
+        subject=f"[Swim Booker] SUCCESS – {day_name} {booked_slot_text} booked",
         body=(
             f"Swim lane successfully booked!\n\n"
             f"Event:  {EVENT_NAME}\n"
             f"Date:   {target_date.strftime('%A, %B %-d, %Y')}\n"
-            f"Time:   {TARGET_TIME}\n"
+            f"Time:   {booked_slot_text}\n"
         ),
         attachment_path=SCREENSHOT_FILE,
     )
     send_slack(
-        f":white_check_mark: *Swim lane booked!* {day_name} {TARGET_TIME} — {target_date.strftime('%A, %B %-d, %Y')}"
+        f":white_check_mark: *Swim lane booked!* {target_date.strftime('%A, %B %-d')} {booked_slot_text}"
     )
 
 

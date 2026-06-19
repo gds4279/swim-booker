@@ -38,7 +38,7 @@ Everything lives in `book_swim.py`. The flow inside `book_once()`:
 2. **Events page** — navigates directly to `/events`
 3. **Find tomorrow's event** — two strategies: (A) find `<a>` tag with event name + tomorrow's date string, (B) find a containing cell/row and extract the nearest link
 4. **Find 8 AM slot** — locates a Register/Book button near `"8:00 AM"` text variants; falls back to any Register button if the slot can't be isolated
-5. **Ticket wizard step 1** — targets Gary's specific member row (`li.event-registration__members-row:has-text("Gary")`), selects the matching time slot via React's `__reactProps` onChange handler to properly update React state
+5. **Ticket wizard step 1** — targets Gary's specific member row (`li.event-registration__members-row:has-text("Gary")`), selects the matching time slot with a priority fallback order: 8:00 AM → 8:45 AM → first available slot. The actual selected slot text (e.g. `"8:00am - 8:40am"`) is captured in `booked_slot_text` by reading the chosen `<option>` text and stripping `" Indoor Pool - Free"`. Uses React's `__reactProps` onChange handler to properly update React state.
 6. **Ticket wizard step 2 (payments/agreement)** — checks the "I Agree" checkbox via React props setter, then clicks the *last* Continue button (step 2's button appears after step 1's in the DOM)
 7. **Confirm** — clicks any Confirm/Yes/Submit button if present
 8. **Verify success** — checks `body` text for success keywords; fails if still on step 2
@@ -62,7 +62,7 @@ Everything lives in `book_swim.py`. The flow inside `book_once()`:
 
 Runs at 7:59 AM Friday and Saturday (books next day's 8 AM slot). Edit with `crontab -e`.
 
-`run.sh` contains `sleep 45` so the script effectively starts at **7:59:45 AM**. Cron itself can't schedule below minute precision; the sleep handles the seconds offset.
+`run.sh` contains `sleep 58` so the script effectively starts at **7:59:58 AM**. Cron itself can't schedule below minute precision; the sleep handles the seconds offset.
 
 ## React State Workaround
 
@@ -75,9 +75,9 @@ The MyTrilogyLife booking wizard is a React app. Normal DOM events (`.click()`, 
 
 Both email and Slack are sent on every run (success and failure).
 
-**Email** — sent via Gmail SMTP (`smtp.gmail.com:587`). `SMTP_USER` is the sender; `NOTIFY_EMAIL` is the primary recipient (defaults to `SMTP_USER`); `dbutler06@comcast.net` is always CC'd.
+**Email** — sent via Gmail SMTP (`smtp.gmail.com:587`). `SMTP_USER` is the sender; `NOTIFY_EMAIL` is the primary recipient (defaults to `SMTP_USER`); `dbutler06@comcast.net` is always CC'd. The subject line and body both show the **actual booked slot** (e.g. `Saturday 3:30pm - 4:25pm booked`), not the target time.
 
-**Slack** — posts to the `#swim-booker` channel via an Incoming Webhook. The webhook URL is stored in `.env` as `SLACK_WEBHOOK_URL`. Uses only stdlib (`json` + `urllib.request`) — no additional dependency. Skipped silently if `SLACK_WEBHOOK_URL` is unset.
+**Slack** — posts to the `#swim-booker` channel via an Incoming Webhook. The webhook URL is stored in `.env` as `SLACK_WEBHOOK_URL`. Uses only stdlib (`json` + `urllib.request`) — no additional dependency. Skipped silently if `SLACK_WEBHOOK_URL` is unset. The success message shows the **actual booked slot**, not the target time — e.g. `Swim lane booked! Saturday, June 20 3:30pm - 4:25pm`.
 
 ## Logs and Artifacts
 
