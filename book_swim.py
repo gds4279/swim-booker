@@ -280,6 +280,11 @@ def book_once() -> None:
                 log.info("Gary's ticket options: %s", options)
                 matched = [o["value"] for o in options if not o["disabled"] and target_norm in o["text"].lower().replace(" ", "")]
                 if not matched:
+                    fallback_norm = "8:45am".replace(" ", "")
+                    matched = [o["value"] for o in options if not o["disabled"] and fallback_norm in o["text"].lower().replace(" ", "")]
+                    if matched:
+                        log.warning("8:00 AM slot unavailable – falling back to 8:45 AM slot")
+                if not matched:
                     matched = [o["value"] for o in options if not o["disabled"] and o["value"] and o["value"] != "0"]
                 if matched:
                     selected_value = matched[0]

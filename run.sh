@@ -4,5 +4,5 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-sleep 45
+sleep 58
 python3 book_swim.py
