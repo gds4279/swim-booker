@@ -12,7 +12,7 @@ Automated script to book the 8:00 AM indoor lap pool lane at MyTrilogyLife.com f
 6. Sends an email (with CC) and a Slack notification with the result and a screenshot
 7. Prunes log entries older than 30 days
 
-Runs automatically at **7:59:45 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
+Runs automatically at **7:59:58 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
 
 ## Setup
 
@@ -62,7 +62,7 @@ The cron schedule (`crontab -e`) is:
 59 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
 ```
 
-This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` includes a `sleep 45` so the script effectively starts at **7:59:45 AM**.
+This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` activates the `.venv` and includes a `sleep 58` so the script effectively starts at **7:59:58 AM**.
 
 ## Notifications
 
@@ -76,7 +76,7 @@ On every run (success or failure) the script sends:
 | File | Purpose |
 |------|---------|
 | `book_swim.py` | Main script |
-| `run.sh` | Shell wrapper (used by cron, includes 45-second delay) |
+| `run.sh` | Shell wrapper (used by cron, activates venv, includes 58-second delay) |
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (not committed) |
 | `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
