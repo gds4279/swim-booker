@@ -386,12 +386,12 @@ def book_once() -> None:
         # 8. Verify success
         # ------------------------------------------------------------------
         page.wait_for_timeout(2000)
-        page_text = page.inner_text("body").lower()
+        page_text = page.inner_text("body").lower().replace("’", "'").replace("‘", "'")
         log.info("Final page URL: %s", page.url)
         # Fail if we're still on step 2 (has step 2 specific text) or no step 3 success text found
         still_on_step2 = "this is confirmation you will pay" in page_text
         success_indicators = ["success! you're going", "you are registered", "ticket purchased",
-                              "thank you", "booking confirmed", "you have been registered"]
+                              "thank you", "booking confirmed", "you have been registered", "3.confirmation"]
         if still_on_step2 or not any(kw in page_text for kw in success_indicators):
             fail(page, f"Not on confirmation page (still_on_step2={still_on_step2})")
 
