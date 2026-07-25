@@ -12,7 +12,7 @@ Automated script to book the 8:00 AM indoor lap pool lane at MyTrilogyLife.com f
 6. Sends an email (with CC) and a Slack notification with the result and a screenshot
 7. Prunes log entries older than 30 days
 
-Runs automatically at **7:59:58 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. Retries up to 5 times on failure.
+Runs automatically at **7:58 AM every Friday and Saturday** via cron, booking the next day's 8:00 AM slot. It starts early on purpose: logging in takes ~16s, so the script gets that done first and then waits at the line until registration opens at exactly 08:00:00. (The event listing itself only publishes at 8:00, so that part cannot be done early — the script re-checks for it for up to 20s.) Retries up to 5 times on failure.
 
 ## Setup
 
@@ -59,10 +59,10 @@ python3 book_swim.py
 The cron schedule (`crontab -e`) is:
 
 ```
-59 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
+58 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
 ```
 
-This runs at 7:59 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` activates the `.venv` and includes a `sleep 58` so the script effectively starts at **7:59:58 AM**.
+This runs at 7:58 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` activates the `.venv` and launches the script immediately — it needs to be *running* before 8:00, not started at 8:00. `book_swim.py` handles the precise timing itself, holding until 08:00:00 before it clicks Register.
 
 ## Notifications
 
@@ -80,7 +80,7 @@ On every run (success or failure) the script sends:
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (not committed) |
 | `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
-| `failure_screenshot.png` | Screenshot captured on failure or success confirmation |
+| `last_run.png` | Screenshot of the final page, success or failure (removed at the start of each run) |
 
 ## Configuration
 
@@ -88,19 +88,25 @@ Key constants at the top of `book_swim.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TARGET_TIME` | `"8:00 AM"` | Time slot to book |
+| `TARGET_TIME` | `"8:00 AM"` | Preferred time slot |
+| `FALLBACK_TIME` | `"8:45 AM"` | Second choice if 8:00 is unavailable or refused |
 | `EVENT_NAME` | `"Indoor Lap Pool Reservations"` | Event to search for |
-| `MAX_ATTEMPTS` | `5` | Retry attempts before giving up |
-| `RETRY_DELAY` | `10` | Seconds between retries |
+| `MAX_ATTEMPTS` | `5` | Retry attempts before giving up (terminal errors stop immediately) |
+| `RETRY_DELAY` | `3` | Seconds between retries |
+| `OPEN_TIME` | `08:00:00` | When registration opens; the script holds until this moment |
+| `MAX_PREOPEN_WAIT` | `900` | Longest it will ever hold before opening (safety cap) |
+| `EVENT_LISTING_PATIENCE` | `20` | Seconds to keep re-checking for the event listing after 8:00 |
 
 ## Troubleshooting
 
 - **Wrong slot booked**: Verify `TARGET_TIME` in `book_swim.py`
 - **Login fails**: Check credentials in `.env`
-- **Booking fails**: Review `swim_booker.log` and `failure_screenshot.png`
+- **Booking fails**: Review `swim_booker.log` and `last_run.png`
 - **Email not sent**: Confirm `SMTP_APP_PASSWORD` is a Gmail App Password, not your login password
 - **Slack not posting**: Confirm `SLACK_WEBHOOK_URL` is set in `.env` and the webhook is active
-- **All slots disabled**: The 8 AM slot may already be taken; script falls back to the next available slot
+- **All slots disabled**: The 8 AM slot may already be taken; script falls back to 8:45 AM, then the next
+  available slot. If every slot is sold out it stops immediately rather than retrying, since retrying
+  cannot bring one back.
 
 ## Security
 

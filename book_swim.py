@@ -7,7 +7,7 @@ import smtplib
 import time
 import traceback
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, time as time_of_day
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -35,12 +35,24 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 LOGIN_URL = "https://www.mytrilogylife.com"
 EVENTS_URL = "https://members.mytrilogylife.com/events"
 TARGET_TIME = "8:00 AM"
+FALLBACK_TIME = "8:45 AM"
 EVENT_NAME = "Indoor Lap Pool Reservations"
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
-SCREENSHOT_FILE = BASE_DIR / "failure_screenshot.png"
+SCREENSHOT_FILE = BASE_DIR / "last_run.png"
 MAX_ATTEMPTS = 5
-RETRY_DELAY = 10  # seconds between attempts
+# The 8:00 slot has been observed selling out ~30-90s after it opens, and a retry
+# costs ~25s of login and navigation on its own. Keep the extra idle wait short.
+RETRY_DELAY = 3  # seconds between attempts
+
+# Registration for the next day opens at 8:00 AM local. Logging in and locating the
+# event takes ~23s, so the script starts early, does that work, and holds here until
+# the window opens - otherwise it arrives ~25s late to a slot that can vanish in 7s.
+OPEN_TIME = time_of_day(8, 0, 0)
+MAX_PREOPEN_WAIT = 15 * 60  # never hold longer than this (guards odd manual runs)
+# Tomorrow's event is only listed once the window opens, and the publish can land a
+# moment after 08:00:00. Keep re-checking rather than failing into a ~20s re-login.
+EVENT_LISTING_PATIENCE = 20.0  # seconds
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -103,29 +115,207 @@ def send_slack(message: str) -> None:
 
 
 class BookingError(Exception):
-    pass
+    """A booking attempt failed.
+
+    `terminal` means retrying cannot help at all. `sold_out_slot` names a specific
+    time the site refused as sold out, so later attempts can stop asking for it.
+    """
+
+    def __init__(self, reason: str, terminal: bool = False, sold_out_slot: str | None = None):
+        super().__init__(reason)
+        self.terminal = terminal
+        self.sold_out_slot = sold_out_slot
 
 
-def fail(page, reason: str) -> None:
+def fail(page, reason: str, terminal: bool = False, sold_out_slot: str | None = None) -> None:
     log.error("FAILED: %s", reason)
     try:
         page.screenshot(path=str(SCREENSHOT_FILE))
         log.info("Screenshot saved to %s", SCREENSHOT_FILE)
     except Exception:
-        pass
-    raise BookingError(reason)
+        # Leave no stale screenshot behind - an absent attachment is clearer
+        # evidence than one left over from a previous run.
+        SCREENSHOT_FILE.unlink(missing_ok=True)
+        log.error("Could not capture screenshot:\n%s", traceback.format_exc())
+    raise BookingError(reason, terminal=terminal, sold_out_slot=sold_out_slot)
+
+
+def seconds_until_open(now: datetime | None = None) -> float:
+    """How long to hold before registration opens. 0 means proceed immediately.
+
+    Returns 0 once past the opening time, so retries later in the run and ad-hoc
+    runs at any other hour go straight through. Also returns 0 if the wait would
+    exceed MAX_PREOPEN_WAIT, so a stray early run never hangs for hours.
+    """
+    now = now or datetime.now()
+    delta = (datetime.combine(now.date(), OPEN_TIME) - now).total_seconds()
+    if delta <= 0 or delta > MAX_PREOPEN_WAIT:
+        return 0.0
+    return delta
+
+
+def wait_until_open() -> bool:
+    """Block until the registration window opens. Returns True if it actually waited."""
+    delta = seconds_until_open()
+    if delta <= 0:
+        raw = (datetime.combine(date.today(), OPEN_TIME) - datetime.now()).total_seconds()
+        if raw > MAX_PREOPEN_WAIT:
+            log.warning("Registration opens in %.0f min, beyond the %.0f min hold cap – proceeding now",
+                        raw / 60, MAX_PREOPEN_WAIT / 60)
+        return False
+
+    target = datetime.now() + timedelta(seconds=delta)
+    log.info("Logged in and staged %.1fs early – holding until registration opens at %s",
+             delta, OPEN_TIME.strftime("%H:%M:%S"))
+    while True:
+        remaining = (target - datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.25))
+    log.info("Registration window open – going now")
+    return True
+
+
+# Scans the events list inside the browser and returns the matching href in a single
+# round-trip. The previous version called inner_text() on every anchor from Python,
+# which cost one round-trip each and seconds overall - time we no longer have, since
+# the listing only publishes at 08:00 and the 8:00 slot can be gone by 08:00:07.
+_FIND_EVENT_JS = """
+([name, d1, d2]) => {
+  const wanted = name.toLowerCase();
+  const dated = t => t.includes(d1) || t.includes(d2);
+
+  for (const a of document.querySelectorAll('a')) {
+    const t = a.innerText || '';
+    if (t.toLowerCase().includes(wanted) && dated(t) && a.href) return a.href;
+  }
+  // Fallback: a row/cell naming the event, then its nearest anchor. textContent
+  // here (not innerText) to avoid forcing layout on every candidate.
+  for (const c of document.querySelectorAll('td, li, div')) {
+    const t = c.textContent || '';
+    if (!t.toLowerCase().includes(wanted) || !dated(t)) continue;
+    const a = c.querySelector('a') || c.closest('a');
+    if (a && a.href) return a.href;
+  }
+  return null;
+}
+"""
+
+
+def find_event_href(page, target_date: date) -> str | None:
+    """Load the events list and return tomorrow's event href, or None if not listed."""
+    page.goto(EVENTS_URL, wait_until="networkidle")
+    return page.evaluate(_FIND_EVENT_JS, [
+        EVENT_NAME,
+        target_date.strftime("%-m/%-d/%Y"),   # e.g. "7/26/2026"
+        target_date.strftime("%B %-d"),       # e.g. "July 26"
+    ])
+
+
+def open_event_page(page, target_date: date, patience: float = 0.0) -> str | None:
+    """Open tomorrow's event detail page. Returns its URL, or None if not listed.
+
+    The listing only publishes at 08:00:00, and the publish may land a moment after
+    our first look, so `patience` keeps re-checking for that many seconds rather than
+    giving up and forcing a full re-login. Returns None rather than failing so the
+    caller can decide whether being early is acceptable.
+    """
+    deadline = time.monotonic() + patience
+    checks = 0
+    while True:
+        checks += 1
+        href = find_event_href(page, target_date)
+        if href:
+            if checks > 1:
+                log.info("Event appeared on check %d", checks)
+            page.goto(href, wait_until="networkidle")
+            return page.url
+        if time.monotonic() >= deadline:
+            return None
+        log.info("Event not listed yet (check %d) – re-checking", checks)
+        page.wait_for_timeout(400)
+
+
+def _norm(s: str) -> str:
+    return s.lower().replace(" ", "")
+
+
+def choose_slot(options: list[dict], preferences: list[str], avoid: set[str]):
+    """Pick a bookable ticket option.
+
+    Walks `preferences` in order, then falls back to the earliest option that is
+    still bookable. Times in `avoid` are skipped entirely - the site has already
+    refused them, so asking again just burns an attempt.
+
+    Returns (value, option_text, matched_preference) or (None, None, None).
+    """
+    avoid_n = [_norm(a) for a in avoid]
+
+    def blocked(text: str) -> bool:
+        return any(a in _norm(text) for a in avoid_n)
+
+    for pref in preferences:
+        for o in options:
+            if not o["disabled"] and _norm(pref) in _norm(o["text"]) and not blocked(o["text"]):
+                return o["value"], o["text"], pref
+
+    for o in options:
+        if o["disabled"] or not o["value"] or o["value"] == "0" or blocked(o["text"]):
+            continue
+        return o["value"], o["text"], None
+
+    return None, None, None
+
+
+def classify_result(page_text: str) -> tuple[str | None, bool]:
+    """Decide whether the wizard's final page represents a real booking.
+
+    Returns (matched_error, succeeded). An error phrase always wins over a success
+    phrase: the site renders errors on the same "3.CONFIRMATION" step as successes.
+    """
+    text = page_text.lower().replace("’", "'").replace("‘", "'")
+    error_indicators = ["unable to complete registration", "could not be completed", "sold out"]
+    # "3.confirmation" is deliberately NOT a success indicator - it is a wizard
+    # breadcrumb ("1.TICKETS 2.PAYMENTS 3.CONFIRMATION") rendered on every step,
+    # including failures, so matching it reports success for a booking that never
+    # happened. Likewise "thank you", which appears in unrelated page furniture.
+    success_indicators = ["success! you're going", "you are registered", "ticket purchased",
+                          "booking confirmed", "you have been registered"]
+    matched_error = next((kw for kw in error_indicators if kw in text), None)
+    succeeded = matched_error is None and any(kw in text for kw in success_indicators)
+    return matched_error, succeeded
+
+
+def settle(page, selector: str, budget_ms: int) -> None:
+    """Wait for `selector` to appear, giving up after `budget_ms`.
+
+    Returns as soon as the next step renders instead of always burning the full
+    budget; falls back to sleeping it out so a missed selector behaves as before.
+    """
+    try:
+        page.wait_for_selector(selector, timeout=budget_ms)
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(budget_ms)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def book_once() -> None:
+def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
+    avoid = avoid or set()
     target_date = date.today() + timedelta(days=1)
     day_name = target_date.strftime("%A")   # e.g. "Saturday"
-    booked_slot_text = TARGET_TIME  # updated to actual slot text if a specific option is selected
-    log.info("Booking %s %s slot for %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
+    booked_slot_text = None  # set only once a specific slot option is actually selected
+    attempted_slot = None    # which preference we committed to, for sold-out reporting
+    verified = False         # set if the reservation is confirmed on a fresh page load
+    log.info("Booking %s %s slot for %s (preferring %s%s)",
+             preferences[0] if preferences else "any available", EVENT_NAME,
+             target_date.isoformat(), " → ".join(preferences) or "any",
+             f", avoiding {', '.join(sorted(avoid))}" if avoid else "")
 
     with sync_playwright() as p:
+        # sync_playwright()'s __exit__ stops the driver and tears down any browser it
+        # launched, on the exception path too - no explicit close needed for cleanup.
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
@@ -159,68 +349,44 @@ def book_once() -> None:
         log.info("Login successful")
 
         # ------------------------------------------------------------------
-        # 2. Events page
+        # 2/3. Stage, hold for the opening bell, then grab the event page
         # ------------------------------------------------------------------
-        log.info("Navigating to %s", EVENTS_URL)
-        page.goto(EVENTS_URL, wait_until="networkidle")
-
-        # ------------------------------------------------------------------
-        # 3. Find Indoor Lap Pool Reservations for tomorrow
-        # ------------------------------------------------------------------
-        target_date_str = target_date.strftime("%-m/%-d/%Y")   # e.g. "4/26/2026"
-        alt_date_str    = target_date.strftime("%B %-d")         # e.g. "April 26"
-
-        log.info("Looking for '%s' on %s", EVENT_NAME, target_date_str)
-
-        event_link = None
-
-        # Strategy A: find an <a> tag whose text contains event name + tomorrow's date
-        for link in page.locator("a").all():
+        # The events list only publishes tomorrow's event at 08:00, so this early
+        # look usually finds nothing. It costs nothing either (we are waiting anyway)
+        # and it warms the session, so we try — but never let it break the run.
+        event_url = None
+        if seconds_until_open() > 0:
             try:
-                text = link.inner_text(timeout=2000)
+                event_url = open_event_page(page, target_date)
+                if event_url is None:
+                    log.info("Event not published yet, as expected – will fetch when the window opens")
             except Exception:
-                continue
-            if EVENT_NAME.lower() in text.lower() and (target_date_str in text or alt_date_str in text):
-                event_link = link
-                log.info("Found event link (Strategy A): %s", text.strip()[:80])
-                break
+                log.warning("Pre-open staging failed harmlessly:\n%s", traceback.format_exc())
 
-        # Strategy B: find a row/cell containing the event name, then grab its nearest <a>
-        if event_link is None:
-            cells = page.locator(f"td:has-text('{EVENT_NAME}'), li:has-text('{EVENT_NAME}'), div:has-text('{EVENT_NAME}')").all()
-            for cell in cells:
-                try:
-                    cell_text = cell.inner_text(timeout=2000)
-                except Exception:
-                    continue
-                if target_date_str in cell_text or alt_date_str in cell_text:
-                    # Try to find a link in the same row/container
-                    row_link = cell.locator("xpath=ancestor::tr//a | ancestor::li//a | a").first
-                    if row_link.count() > 0:
-                        event_link = row_link
-                        log.info("Found event link (Strategy B row link)")
-                        break
-                    # Fallback: click the href of the row if the row itself is a link
-                    href = cell.evaluate("el => el.closest('a')?.href || ''")
-                    if href:
-                        page.goto(href, wait_until="networkidle")
-                        log.info("Navigated directly to event href (Strategy B href): %s", href)
-                        break
+        wait_until_open()
 
-        if event_link is None and "Indoor Lap Pool" not in page.url:
-            fail(page, f"Could not find a clickable link for '{EVENT_NAME}' on {target_date_str}")
+        # Anything fetched above was fetched before the window opened, so it is always
+        # refreshed here - never branch on whether we actually waited, or a run that
+        # straddles 08:00:00 during staging would proceed on a stale pre-open page.
+        if event_url is not None:
+            log.info("Refreshing the event page now that registration is open")
+            page.goto(event_url, wait_until="networkidle")
+        else:
+            event_url = open_event_page(page, target_date, patience=EVENT_LISTING_PATIENCE)
 
-        if event_link is not None:
-            event_link.scroll_into_view_if_needed()
-            event_link.click()
-            page.wait_for_load_state("networkidle")
+        if event_url is None:
+            fail(page, f"'{EVENT_NAME}' for {target_date.strftime('%-m/%-d/%Y')} never appeared "
+                       f"on the events page within {EVENT_LISTING_PATIENCE:.0f}s of opening")
 
-        log.info("Opened event detail page: %s", page.url)
+        log.info("On event detail page: %s", event_url)
 
         # ------------------------------------------------------------------
         # 4. Find 8 AM slot and register
         # ------------------------------------------------------------------
-        log.info("Looking for %s slot", TARGET_TIME)
+        # Names the slot we are actually after, which differs from TARGET_TIME once a
+        # pivot has happened. The button choice does not decide the booking - the
+        # wizard dropdown does - so the 8:00 variants stay as the search anchor.
+        log.info("Looking for the %s slot", preferences[0] if preferences else "earliest open")
 
         # Look for a register/book button near the "8:00 AM" / "8:00am" text
         time_variants = ["8:00 AM", "8:00am", "8:00 am", "8:00AM"]
@@ -270,58 +436,60 @@ def book_once() -> None:
         # ------------------------------------------------------------------
         # Target Gary's specific member row (not the whole form, not Dawn's row)
         gary_row = page.locator("li.event-registration__members-row").filter(has_text="Gary").first
-        if gary_row.count() > 0:
-            log.info("Ticket selection step detected – targeting Gary's member row")
-            target_norm = TARGET_TIME.lower().replace(" ", "")
-            gary_select = gary_row.locator("select").first
-            if gary_select.count() > 0:
-                options = gary_select.evaluate(
-                    "el => [...el.options].map(o => ({value: o.value, text: o.text, disabled: o.disabled}))"
-                )
-                log.info("Gary's ticket options: %s", options)
-                matched = [o["value"] for o in options if not o["disabled"] and target_norm in o["text"].lower().replace(" ", "")]
-                if not matched:
-                    fallback_norm = "8:45am".replace(" ", "")
-                    matched = [o["value"] for o in options if not o["disabled"] and fallback_norm in o["text"].lower().replace(" ", "")]
-                    if matched:
-                        log.warning("8:00 AM slot unavailable – falling back to 8:45 AM slot")
-                if not matched:
-                    matched = [o["value"] for o in options if not o["disabled"] and o["value"] and o["value"] != "0"]
-                if matched:
-                    selected_value = matched[0]
-                    raw_text = next((o["text"] for o in options if o["value"] == selected_value), TARGET_TIME)
-                    booked_slot_text = raw_text.split(" Indoor")[0].strip()
-                    log.info("Selecting Gary's slot: %s (%s)", selected_value, booked_slot_text)
-                    try:
-                        gary_select.select_option(value=selected_value, timeout=5000)
-                        log.info("Selected via Playwright select_option")
-                    except Exception as e:
-                        log.warning("select_option failed (%s) – trying JS setter", e)
-                    # Re-trigger React's change event so its state updates
-                    gary_select.evaluate(
-                        "(el, val) => { const s = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; s.call(el,val); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }",
-                        selected_value,
-                    )
-                else:
-                    log.warning("No available time slot found for %s in Gary's options", TARGET_TIME)
+        if gary_row.count() == 0:
+            fail(page, "Ticket selection step never appeared – no member row for Gary")
 
-            next_btn = page.locator(
-                "#continue-button, button:has-text('Continue'), button:has-text('Next'), "
-                "a:has-text('Next'), a:has-text('Continue')"
-            ).first
-            if next_btn.count() > 0:
-                log.info("Waiting for Continue to enable after slot selection")
-                try:
-                    next_btn.wait_for(state="enabled", timeout=15000)
-                    log.info("Continue enabled – clicking")
-                    next_btn.click()
-                except Exception:
-                    log.warning("Continue still disabled – force-clicking via JS")
-                    next_btn.evaluate(
-                        "el => { el.disabled = false; el.classList.remove('cta--disabled'); el.click(); }"
-                    )
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(1500)
+        log.info("Ticket selection step detected – targeting Gary's member row")
+        gary_select = gary_row.locator("select").first
+        if gary_select.count() == 0:
+            fail(page, "Gary's member row has no time-slot dropdown")
+
+        options = gary_select.evaluate(
+            "el => [...el.options].map(o => ({value: o.value, text: o.text, disabled: o.disabled}))"
+        )
+        log.info("Gary's ticket options: %s", options)
+
+        selected_value, raw_text, attempted_slot = choose_slot(options, preferences, avoid)
+        if selected_value is None:
+            # Nothing bookable at all - not even a late slot. Retrying cannot help.
+            fail(page, f"No bookable time slot for {target_date.isoformat()} – all slots sold out",
+                 terminal=True)
+
+        booked_slot_text = raw_text.split(" Indoor")[0].strip()
+        if attempted_slot is None:
+            log.warning("No preferred slot available – falling back to %s", booked_slot_text)
+        elif preferences and attempted_slot != preferences[0]:
+            log.warning("%s unavailable – falling back to %s", preferences[0], attempted_slot)
+        log.info("Selecting Gary's slot: %s (%s)", selected_value, booked_slot_text)
+        try:
+            gary_select.select_option(value=selected_value, timeout=5000)
+            log.info("Selected via Playwright select_option")
+        except Exception as e:
+            log.warning("select_option failed (%s) – trying JS setter", e)
+        # Re-trigger React's change event so its state updates
+        gary_select.evaluate(
+            "(el, val) => { const s = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set; s.call(el,val); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }",
+            selected_value,
+        )
+
+        next_btn = page.locator(
+            "#continue-button, button:has-text('Continue'), button:has-text('Next'), "
+            "a:has-text('Next'), a:has-text('Continue')"
+        ).first
+        if next_btn.count() > 0:
+            log.info("Waiting for Continue to enable after slot selection")
+            try:
+                next_btn.wait_for(state="enabled", timeout=15000)
+                log.info("Continue enabled – clicking")
+                next_btn.click()
+            except Exception:
+                log.warning("Continue still disabled – force-clicking via JS")
+                next_btn.evaluate(
+                    "el => { el.disabled = false; el.classList.remove('cta--disabled'); el.click(); }"
+                )
+            page.wait_for_load_state("networkidle")
+            # Step 2 is the agreement checkbox - proceed as soon as it renders
+            settle(page, "input[type='checkbox']", 1500)
 
         # ------------------------------------------------------------------
         # 6. Handle payments/agreement step if present (step 2 of wizard)
@@ -344,6 +512,7 @@ def book_once() -> None:
                 el.dispatchEvent(new Event('input', {bubbles: true}));
                 return 'native_events';
             }""")
+            log.info("'I Agree' checked via %s", cb_result)
             page.wait_for_timeout(1500)
 
             # Use the LAST visible Continue button — step 2's button comes after step 1's in the DOM
@@ -368,7 +537,8 @@ def book_once() -> None:
                         }
                     }""")
                 page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(2000)
+                # Step 3 renders either the confirmation or an error - either ends the wait
+                settle(page, "text=/Ticket Purchased|Unable to complete|sold out/i", 2000)
 
         # ------------------------------------------------------------------
         # 7. Confirm if a confirmation dialog/button appears
@@ -385,20 +555,59 @@ def book_once() -> None:
         # ------------------------------------------------------------------
         # 8. Verify success
         # ------------------------------------------------------------------
-        page.wait_for_timeout(2000)
-        page_text = page.inner_text("body").lower().replace("’", "'").replace("‘", "'")
+        settle(page, "text=/Ticket Purchased|Unable to complete|sold out/i", 2000)
         log.info("Final page URL: %s", page.url)
-        # Fail if we're still on step 2 (has step 2 specific text) or no step 3 success text found
-        still_on_step2 = "this is confirmation you will pay" in page_text
-        success_indicators = ["success! you're going", "you are registered", "ticket purchased",
-                              "thank you", "booking confirmed", "you have been registered", "3.confirmation"]
-        if still_on_step2 or not any(kw in page_text for kw in success_indicators):
-            fail(page, f"Not on confirmation page (still_on_step2={still_on_step2})")
+
+        # Read the registration modal rather than the whole body: generic phrases like
+        # "thank you" live in page furniture (footers, banners) and would otherwise
+        # read as a booking confirmation.
+        scope = page.locator(".event-registration, [class*='event-registration']").first
+        if scope.count() > 0:
+            page_text = scope.inner_text()
+        else:
+            log.warning("Registration modal not found – falling back to full body text")
+            page_text = page.inner_text("body")
+        matched_error, succeeded = classify_result(page_text)
+        if not succeeded:
+            reason = f"Registration error: {matched_error}" if matched_error else "Not on confirmation page"
+            # A slot that looked open in the dropdown can still be gone by submission -
+            # report which one so the retry stops asking for it. Not terminal: another
+            # time may well still be free.
+            refused = (attempted_slot or booked_slot_text) if "sold out" in page_text.lower() else None
+            if refused:
+                log.warning("Site refused %s as sold out – it will be skipped on retry", refused)
+            fail(page, reason, sold_out_slot=refused)
 
         log.info("SUCCESS – registered for %s %s on %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
-
         page.screenshot(path=str(SCREENSHOT_FILE))
+
+        # ------------------------------------------------------------------
+        # 9. Independently confirm the reservation actually persisted
+        # ------------------------------------------------------------------
+        # The wizard rendering a confirmation is not proof the booking stuck - reload
+        # the event page and look for the reservation. This never fails the run: the
+        # booking is already made, and a retry here could double-book.
+        try:
+            page.goto(event_url, wait_until="networkidle")
+            registered_text = page.inner_text("body").lower()
+            verified = "registered" in registered_text or "cancel registration" in registered_text
+            if verified:
+                log.info("Verified: reservation is present on a fresh load of the event page")
+            else:
+                log.warning("Could NOT independently verify the reservation on the event page")
+        except Exception:
+            log.warning("Independent verification step failed to run:\n%s", traceback.format_exc())
+
         browser.close()
+
+    # Reaching here without a slot means the verification above let something through
+    # that it should not have - refuse to claim a booking we cannot name.
+    if not booked_slot_text:
+        raise BookingError("Reported success but no time slot was ever selected")
+
+    verify_note = ("" if verified else
+                   "\nNOTE: the confirmation page was shown, but reloading the event page "
+                   "did not show the reservation. Worth checking manually.\n")
 
     send_email(
         subject=f"[Swim Booker] SUCCESS – {day_name} {booked_slot_text} booked",
@@ -407,11 +616,13 @@ def book_once() -> None:
             f"Event:  {EVENT_NAME}\n"
             f"Date:   {target_date.strftime('%A, %B %-d, %Y')}\n"
             f"Time:   {booked_slot_text}\n"
+            f"{verify_note}"
         ),
         attachment_path=SCREENSHOT_FILE,
     )
     send_slack(
         f":white_check_mark: *Swim lane booked!* {target_date.strftime('%A, %B %-d')} {booked_slot_text}"
+        + ("" if verified else " _(could not independently verify — please check)_")
     )
 
 
@@ -432,31 +643,56 @@ def trim_log() -> None:
 
 
 def main() -> None:
+    # Start clean so a screenshot from an earlier run can never be attached as if it
+    # were evidence from this one.
+    SCREENSHOT_FILE.unlink(missing_ok=True)
+
     last_exc: BaseException | None = None
+    last_tb = ""
+    attempts_used = 0
+    # First attempt chases 8:00 exactly as before. Once the site confirms a time is
+    # sold out, it is dropped so the remaining attempts pivot to the next choice
+    # instead of re-submitting a booking the site has already refused.
+    preferences = [TARGET_TIME, FALLBACK_TIME]
+    avoid: set[str] = set()
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempts_used = attempt
         try:
             log.info("Attempt %d/%d", attempt, MAX_ATTEMPTS)
-            book_once()
+            book_once(preferences, avoid)
             trim_log()
             return
-        except (BookingError, Exception) as exc:
+        except Exception as exc:
             last_exc = exc
+            # Must be captured inside the handler - outside it, format_exc() has no
+            # active exception to report and returns "NoneType: None".
+            last_tb = traceback.format_exc()
             log.warning("Attempt %d/%d failed: %s", attempt, MAX_ATTEMPTS, exc)
+            if isinstance(exc, BookingError) and exc.terminal:
+                log.error("Condition will not clear on retry – not attempting again")
+                break
+            refused = getattr(exc, "sold_out_slot", None)
+            if refused and refused not in avoid:
+                avoid.add(refused)
+                preferences = [p for p in preferences if p not in avoid]
+                log.warning("%s confirmed sold out – remaining attempts will target %s",
+                            refused, " → ".join(preferences) or "the earliest open slot")
             if attempt < MAX_ATTEMPTS:
                 log.info("Retrying in %d seconds…", RETRY_DELAY)
                 time.sleep(RETRY_DELAY)
 
     reason = str(last_exc) if last_exc else "unknown error"
-    log.error("All %d attempts failed", MAX_ATTEMPTS)
+    log.error("Giving up after %d attempt(s)", attempts_used)
     send_email(
         subject=f"[Swim Booker] FAILED – {reason[:60]}",
         body=(
-            f"Swim lane booking failed after {MAX_ATTEMPTS} attempts.\n\n"
-            f"Last error: {reason}\n\n{traceback.format_exc()}"
+            f"Swim lane booking failed after {attempts_used} attempt(s).\n\n"
+            f"Last error: {reason}\n\n{last_tb}"
         ),
         attachment_path=SCREENSHOT_FILE,
     )
-    send_slack(f":x: *Swim booking FAILED* after {MAX_ATTEMPTS} attempts — {reason[:120]}")
+    send_slack(f":x: *Swim booking FAILED* after {attempts_used} attempt(s) — {reason[:120]}")
     trim_log()
     sys.exit(1)
 
