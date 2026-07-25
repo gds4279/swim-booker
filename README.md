@@ -76,7 +76,7 @@ On every run (success or failure) the script sends:
 | File | Purpose |
 |------|---------|
 | `book_swim.py` | Main script |
-| `run.sh` | Shell wrapper (used by cron, activates venv, includes 58-second delay) |
+| `run.sh` | Shell wrapper (used by cron; activates venv and launches immediately — the script does its own timing) |
 | `requirements.txt` | Python dependencies |
 | `.env` | Credentials (not committed) |
 | `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
@@ -99,9 +99,15 @@ Key constants at the top of `book_swim.py`:
 
 ## Troubleshooting
 
-- **Wrong slot booked**: Verify `TARGET_TIME` in `book_swim.py`
+- **Wrong slot booked**: Check `TARGET_TIME` / `FALLBACK_TIME` in `book_swim.py`. Booking a later slot than
+  expected is normal when 8:00 and 8:45 were both gone — the log names the slot it settled on and why.
 - **Login fails**: Check credentials in `.env`
-- **Booking fails**: Review `swim_booker.log` and `last_run.png`
+- **Booking fails**: Review `swim_booker.log` and `last_run.png`. The failure email carries the real
+  traceback; if it ever reads `NoneType: None`, `traceback.format_exc()` has been moved outside its
+  `except` block again.
+- **Missed the 8:00 slot**: Check how late the log's dropdown read is versus 08:00:00. The job starts at
+  7:58 so only the event-listing fetch happens after the bell; arriving much past ~08:00:05 means the
+  listing was slow, and `EVENT_LISTING_PATIENCE` is the knob.
 - **Email not sent**: Confirm `SMTP_APP_PASSWORD` is a Gmail App Password, not your login password
 - **Slack not posting**: Confirm `SLACK_WEBHOOK_URL` is set in `.env` and the webhook is active
 - **All slots disabled**: The 8 AM slot may already be taken; script falls back to 8:45 AM, then the next
