@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A single-file Python automation script (`book_swim.py`) that uses Playwright to book an Indoor Lap Pool lane at MyTrilogyLife.com for the following day. Runs via cron at **7:58 AM** on Fridays (books Saturday) and Saturdays (books Sunday) — early on purpose, so login finishes before registration opens at 08:00:00 and the script is waiting at the line rather than arriving late. Retries up to 5 times on failure, then sends an email and Slack notification either way.
+A single-file Python automation script (`book_swim.py`) that uses Playwright to book an Indoor Lap Pool lane at MyTrilogyLife.com for the following day. Runs via cron at **7:58 AM** on Monday, Wednesday, Friday and Saturday — early on purpose, so login finishes before registration opens at 08:00:00 and the script is waiting at the line rather than arriving late. Retries up to 5 times on failure, then sends an email and Slack notification either way.
 
-What it books is driven by `SCHEDULE`, keyed on the weekday of the day being **booked** (Mon=0 … Sun=6), not the day the script runs. Weekends prefer 8:00 AM then 8:45 AM and will settle for a later lane up to a 9:30 AM cutoff. A weekday plan for **Tuesday/Thursday 6:15 AM** exists in `WEEKDAY_SCHEDULE` but is **not enabled in cron** — only `--dry-run` reaches it. See `TODO.md`.
+What it books is driven by `SCHEDULE`, keyed on the weekday of the day being **booked** (Mon=0 … Sun=6), not the day the script runs:
+
+| Day booked | Prefers | If unavailable |
+|---|---|---|
+| Tuesday, Thursday | 6:15 AM | Books **nothing**. Any later lane misses the start of the work day, so a "booked" email for one is worse than a failure notice |
+| Saturday, Sunday | 8:00 AM → 8:45 AM | A later lane, **no earlier than 8:00 AM** and **no later than 9:30 AM** |
 
 `--dry-run` logs in, opens the wizard far enough to read Gary's slot dropdown, prints the grid and what the current config *would* book, then exits without selecting anything. It never books. Started before 08:00 it goes through the full opening-bell hold, which is the only way to see a grid before the day sells out.
 
@@ -77,8 +82,8 @@ A slot whose start time will not parse is skipped, never guessed at. When `any_o
 
 | Variable | Value | Notes |
 |---|---|---|
-| `SCHEDULE` | `{5: …, 6: …}` | What to book, keyed on the weekday **being booked** (Mon=0 … Sun=6). Weekends: `["8:00 AM", "8:45 AM"]`, `any_open=True`, `latest=9:30 AM` |
-| `WEEKDAY_SCHEDULE` | `["6:15 AM"]`, `any_open=False` | Tue/Thu plan. Reachable only via `--dry-run` until it is moved into `SCHEDULE` under keys 1 and 3 |
+| `SCHEDULE` | `{1, 3, 5, 6}` | What to book, keyed on the weekday **being booked** (Mon=0 … Sun=6). Tue/Thu: `["6:15 AM"]`, `any_open=False`. Sat/Sun: `["8:00 AM", "8:45 AM"]`, `any_open=True`, `latest=9:30 AM` |
+| `DRY_RUN_PROBE` | `["6:15 AM"]`, `any_open=False` | The plan `--dry-run` assumes for a day not in `SCHEDULE`, so recon works on any day. Never used by a real run |
 | `EVENT_NAME` | `"Indoor Lap Pool Reservation"` | **Singular on purpose** — weekday events are titled `…Reservation`, weekend ones `…Reservations`. The singular stem is a substring of both. Do not "correct" it |
 | `LANE_TYPE` | `"indoor"` | Substring an option must contain to count as a lap lane, filtering out `Water Fitness` |
 | `MAX_ATTEMPTS` | `5` | Total tries before giving up |
@@ -90,12 +95,12 @@ A slot whose start time will not parse is skipped, never guessed at. When `any_o
 ## Cron Schedule
 
 ```cron
-58 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
+58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
 ```
 
-Runs at 7:58 AM Friday and Saturday (books next day's 8 AM slot). Edit with `crontab -e`.
+Runs at 7:58 AM Monday, Wednesday, Friday and Saturday — each booking the *next* day: Mon→Tue, Wed→Thu, Fri→Sat, Sat→Sun. Edit with `crontab -e`.
 
-To enable Tue/Thu 6:15 AM: move `WEEKDAY_SCHEDULE` into `SCHEDULE` under keys 1 and 3, and set the cron line to `58 7 * * 1,3,5,6`. Cron day numbers and `SCHEDULE` keys are the same digits here — cron numbering is Python's plus one, and the day booked is always the next day.
+The cron day numbers and the `SCHEDULE` keys are the same digits (1, 3, 5, 6), which is a coincidence worth understanding before changing either: cron numbering is Python's `weekday()` plus one, and the day booked is always the day after the run, so the two offsets cancel. Change one and you must re-derive the other rather than copying it.
 
 **The job starts early on purpose.** Registration opens at 08:00:00 and the 8:00 slot has been seen selling out within ~7s of that. Logging in takes ~16s and used to happen *after* the window opened, so the script reached the ticket dropdown a median of **25s late** (measured across 10 logged runs).
 

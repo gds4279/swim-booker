@@ -56,17 +56,23 @@ class DaySchedule(NamedTuple):
 
 
 SCHEDULE: dict[int, DaySchedule] = {
+    # Weekdays: 6:15 is the only lane that still gets Gary to work on time, so there
+    # is no fallback at all - any later lane is useless and a "booked" email for one
+    # is worse than a failure notice. Grid confirmed 2026-07-28 against Wednesday's
+    # event: "6:15am-6:55am Indoor Pool - Free", open.
+    1: DaySchedule(["6:15 AM"], any_open=False),   # Tuesday
+    3: DaySchedule(["6:15 AM"], any_open=False),   # Thursday
     # Weekends: a later swim is still a swim, but not at any hour - without the
     # cutoff a busy Saturday could quietly book an 8:30 PM lane and call it success.
+    # The fallback floor is 8:00 AM: choose_slot derives it from preferences[0], so
+    # the weekend never books a lane earlier than the target, only a later one.
     5: DaySchedule(["8:00 AM", "8:45 AM"], any_open=True, latest=time_of_day(9, 30)),
     6: DaySchedule(["8:00 AM", "8:45 AM"], any_open=True, latest=time_of_day(9, 30)),
 }
 
-# Weekday 6:15 AM swims. The grid was confirmed on 2026-07-28 against Wednesday's
-# event: "6:15am-6:55am Indoor Pool - Free", open. Still not enabled in cron - moving
-# this into SCHEDULE under keys 1 and 3 is the remaining step. No fallback at all:
-# any later lane misses the start of the work day.
-WEEKDAY_SCHEDULE = DaySchedule(["6:15 AM"], any_open=False)
+# The plan --dry-run assumes for a day we do not book, so recon is possible on any
+# day of the week. Not used by real runs: every day we actually book is in SCHEDULE.
+DRY_RUN_PROBE = DaySchedule(["6:15 AM"], any_open=False)
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
 SCREENSHOT_FILE = BASE_DIR / "last_run.png"
@@ -823,19 +829,23 @@ def trim_log() -> None:
     LOG_FILE.write_text("".join(kept))
 
 
-def schedule_for(target_date: date, weekday_recon: bool = False) -> DaySchedule | None:
-    """The plan for the day being booked, or None if we do not swim that day."""
-    if weekday_recon and target_date.weekday() not in SCHEDULE:
-        return WEEKDAY_SCHEDULE
+def schedule_for(target_date: date, probe: bool = False) -> DaySchedule | None:
+    """The plan for the day being booked, or None if we do not swim that day.
+
+    `probe` is for --dry-run only: it lets recon inspect a day that is not on the
+    schedule at all, rather than refusing to look. A real run must never pass it, or
+    it would book on a day Gary does not swim.
+    """
+    if probe and target_date.weekday() not in SCHEDULE:
+        return DRY_RUN_PROBE
     return SCHEDULE.get(target_date.weekday())
 
 
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
     target_date = date.today() + timedelta(days=1)
-    # A dry run is for inspecting a day we do not yet book, so fall back to the
-    # candidate weekday plan rather than refusing to look.
-    plan = schedule_for(target_date, weekday_recon=dry_run)
+    # A dry run is for inspecting any day, including ones we do not book.
+    plan = schedule_for(target_date, probe=dry_run)
 
     if plan is None:
         log.info("Nothing scheduled for %s – exiting without booking",

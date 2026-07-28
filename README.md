@@ -12,16 +12,18 @@ Automated script to book an indoor lap pool lane at MyTrilogyLife.com for the ne
 6. Sends an email (with CC) and a Slack notification with the result and a screenshot
 7. Prunes log entries older than 30 days
 
-Runs automatically at **7:58 AM every Friday and Saturday** via cron, booking the next day's slot. It starts early on purpose: logging in takes ~16s, so the script gets that done first and then waits at the line until registration opens at exactly 08:00:00. (The event only becomes reachable at 8:00, so that fetch cannot be done early — the script re-checks for it for up to 20s.) Retries up to 5 times on failure.
+Runs automatically at **7:58 AM every Monday, Wednesday, Friday and Saturday** via cron, booking the next day's slot. It starts early on purpose: logging in takes ~16s, so the script gets that done first and then waits at the line until registration opens at exactly 08:00:00. (The event only becomes reachable at 8:00, so that fetch cannot be done early — the script re-checks for it for up to 20s.) Retries up to 5 times on failure.
 
 ### What gets booked
 
 `SCHEDULE` in `book_swim.py` is keyed on the weekday of the day being **booked**, not the day the script runs:
 
-| Day booked | Prefers | If unavailable |
-|---|---|---|
-| Saturday, Sunday | 8:00 AM, then 8:45 AM | Settles for the next open lane, **no later than 9:30 AM** and never earlier than 8:00 AM |
-| Tuesday, Thursday *(not yet enabled)* | 6:15 AM | Books **nothing** — a later weekday lane misses the start of the work day |
+| Run day | Day booked | Prefers | If unavailable |
+|---|---|---|---|
+| Monday | Tuesday | 6:15 AM | Books **nothing** — a later weekday lane misses the start of the work day |
+| Wednesday | Thursday | 6:15 AM | Books **nothing** |
+| Friday | Saturday | 8:00 AM, then 8:45 AM | The next open lane, **no earlier than 8:00 AM** and **no later than 9:30 AM** |
+| Saturday | Sunday | 8:00 AM, then 8:45 AM | Same |
 
 Only lanes count. The dropdown also lists `Water Fitness`, which is a class, not a lane; it is never booked, even at a preferred time.
 
@@ -78,10 +80,10 @@ python3 book_swim.py
 The cron schedule (`crontab -e`) is:
 
 ```
-58 7 * * 5,6 /home/gary/projects/swim-booker/run.sh
+58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
 ```
 
-This runs at 7:58 AM on Fridays (books Saturday) and Saturdays (books Sunday). `run.sh` activates the `.venv` and launches the script immediately — it needs to be *running* before 8:00, not started at 8:00. `book_swim.py` handles the precise timing itself, holding until 08:00:00 before it clicks Register.
+This runs at 7:58 AM on Monday (books Tuesday), Wednesday (books Thursday), Friday (books Saturday) and Saturday (books Sunday). `run.sh` activates the `.venv` and launches the script immediately — it needs to be *running* before 8:00, not started at 8:00. `book_swim.py` handles the precise timing itself, holding until 08:00:00 before it clicks Register.
 
 ## Notifications
 
@@ -107,8 +109,8 @@ Key constants at the top of `book_swim.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCHEDULE` | Sat/Sun 8:00 → 8:45 | What to book per day, keyed on the weekday being booked (Mon=0 … Sun=6) |
-| `WEEKDAY_SCHEDULE` | `6:15 AM`, no fallback | Tue/Thu plan; reachable only via `--dry-run` until enabled in cron |
+| `SCHEDULE` | Tue/Thu 6:15; Sat/Sun 8:00 → 8:45 | What to book per day, keyed on the weekday being booked (Mon=0 … Sun=6) |
+| `DRY_RUN_PROBE` | `6:15 AM`, no fallback | The plan `--dry-run` assumes for a day not in `SCHEDULE`; never used by a real run |
 | `EVENT_NAME` | `"Indoor Lap Pool Reservation"` | Event to search for. Singular on purpose — weekday events use the singular, weekend ones the plural, and this stem matches both |
 | `LANE_TYPE` | `"indoor"` | A slot must contain this to count as a lap lane (filters out `Water Fitness`) |
 | `MAX_ATTEMPTS` | `5` | Retry attempts before giving up (terminal errors stop immediately) |
