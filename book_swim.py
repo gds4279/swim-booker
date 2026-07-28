@@ -13,6 +13,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -34,9 +35,38 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 LOGIN_URL = "https://www.mytrilogylife.com"
 EVENTS_URL = "https://members.mytrilogylife.com/events"
-TARGET_TIME = "8:00 AM"
-FALLBACK_TIME = "8:45 AM"
-EVENT_NAME = "Indoor Lap Pool Reservations"
+# Singular on purpose. Weekday events are titled "Indoor Lap Pool Reservation |
+# Tuesday, July 28" while the weekend ones say "…Reservations". The singular stem is
+# a substring of both, so it matches either naming. Observed 2026-07-27, when the
+# plural form matched nothing and the weekday dry run failed to find the event.
+EVENT_NAME = "Indoor Lap Pool Reservation"
+
+# What to book, keyed on the weekday of the day being BOOKED (Mon=0 … Sun=6).
+# `any_open` says whether an unlisted time is acceptable when no preference is free:
+# on weekends a later swim is still a swim, but a weekday lane is only useful at
+# 6:15 — anything later misses the start of the work day, so we book nothing.
+#
+# NOTE: the times here are swim times. They are unrelated to OPEN_TIME below, which
+# is when registration opens (08:00 every day). The two were the same number while
+# this was weekend-only; they are not the same thing.
+class DaySchedule(NamedTuple):
+    preferences: list[str]   # tried in order; an exact match always wins
+    any_open: bool           # settle for another slot if no preference is free?
+    latest: time_of_day | None = None   # latest start time that fallback may accept
+
+
+SCHEDULE: dict[int, DaySchedule] = {
+    # Weekends: a later swim is still a swim, but not at any hour - without the
+    # cutoff a busy Saturday could quietly book an 8:30 PM lane and call it success.
+    5: DaySchedule(["8:00 AM", "8:45 AM"], any_open=True, latest=time_of_day(9, 30)),
+    6: DaySchedule(["8:00 AM", "8:45 AM"], any_open=True, latest=time_of_day(9, 30)),
+}
+
+# Weekday 6:15 AM swims. The grid was confirmed on 2026-07-28 against Wednesday's
+# event: "6:15am-6:55am Indoor Pool - Free", open. Still not enabled in cron - moving
+# this into SCHEDULE under keys 1 and 3 is the remaining step. No fallback at all:
+# any later lane misses the start of the work day.
+WEEKDAY_SCHEDULE = DaySchedule(["6:15 AM"], any_open=False)
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
 SCREENSHOT_FILE = BASE_DIR / "last_run.png"
@@ -180,26 +210,34 @@ def wait_until_open() -> bool:
 # round-trip. The previous version called inner_text() on every anchor from Python,
 # which cost one round-trip each and seconds overall - time we no longer have, since
 # the listing only publishes at 08:00 and the 8:00 slot can be gone by 08:00:07.
-_FIND_EVENT_JS = """
+_FIND_EVENT_JS = r"""
 ([name, d1, d2]) => {
   const wanted = name.toLowerCase();
-  const dated = t => t.includes(d1) || t.includes(d2);
 
+  // The match must come from a single anchor that names both the event and the date
+  // and points at an event *detail* page. There used to be a broader fallback that
+  // scanned td/li/div for a container mentioning both, then took an anchor from it.
+  // It cannot work: querySelectorAll returns outermost-first, so the first "match" is
+  // a whole-page wrapper, and the anchor it yields is unrelated to the date that
+  // matched. It returned the top-nav "EVENTS" link (/events) for an unopened day -
+  // and, once restricted to /events/<id> links, returned a *different day's event*,
+  // which is worse: a plausible URL that books the wrong day. Verified 2026-07-28
+  // against Thursday 7/30, which resolved to Tuesday's event 1849591.
+  // If this ever stops matching, fail loudly rather than reinstating a guess.
   for (const a of document.querySelectorAll('a')) {
     const t = a.innerText || '';
-    if (t.toLowerCase().includes(wanted) && dated(t) && a.href) return a.href;
-  }
-  // Fallback: a row/cell naming the event, then its nearest anchor. textContent
-  // here (not innerText) to avoid forcing layout on every candidate.
-  for (const c of document.querySelectorAll('td, li, div')) {
-    const t = c.textContent || '';
-    if (!t.toLowerCase().includes(wanted) || !dated(t)) continue;
-    const a = c.querySelector('a') || c.closest('a');
-    if (a && a.href) return a.href;
+    if (!t.toLowerCase().includes(wanted)) continue;
+    if (!t.includes(d1) && !t.includes(d2)) continue;
+    if (a.href && /\/events\/\d+/.test(a.href)) return a.href;
   }
   return null;
 }
 """
+
+
+# An event detail page is /events/<numeric id>. The bare listing URL is not one, and
+# telling them apart is load-bearing - see open_event_page.
+_EVENT_DETAIL_RE = re.compile(r"/events/\d+")
 
 
 def find_event_href(page, target_date: date) -> str | None:
@@ -219,6 +257,14 @@ def open_event_page(page, target_date: date, patience: float = 0.0) -> str | Non
     our first look, so `patience` keeps re-checking for that many seconds rather than
     giving up and forcing a full re-login. Returns None rather than failing so the
     caller can decide whether being early is acceptable.
+
+    A link alone is not proof the event is open: tomorrow's event is *listed* before
+    08:00 but its detail page is not reachable yet, and the site quietly redirects
+    back to the listing. So the landing URL is checked, not just the href. Returning
+    page.url unverified is what broke the 2026-07-28 run - `event_url` became the bare
+    listing URL, which is not None, so the caller treated the *listing* as the event
+    page, refreshed it at 08:00:00 and clicked a Register button belonging to an
+    unrelated event.
     """
     deadline = time.monotonic() + patience
     checks = 0
@@ -226,13 +272,17 @@ def open_event_page(page, target_date: date, patience: float = 0.0) -> str | Non
         checks += 1
         href = find_event_href(page, target_date)
         if href:
-            if checks > 1:
-                log.info("Event appeared on check %d", checks)
             page.goto(href, wait_until="networkidle")
-            return page.url
+            if _EVENT_DETAIL_RE.search(page.url):
+                if checks > 1:
+                    log.info("Event appeared on check %d", checks)
+                return page.url
+            reason = f"link redirected to {page.url} – not open yet"
+        else:
+            reason = "not listed yet"
         if time.monotonic() >= deadline:
             return None
-        log.info("Event not listed yet (check %d) – re-checking", checks)
+        log.info("Event %s (check %d) – re-checking", reason, checks)
         page.wait_for_timeout(400)
 
 
@@ -240,12 +290,60 @@ def _norm(s: str) -> str:
     return s.lower().replace(" ", "")
 
 
-def choose_slot(options: list[dict], preferences: list[str], avoid: set[str]):
+# Not every ticket in a lap-pool event is lap swimming. The weekday grid read on
+# 2026-07-29 offered "Water Fitness" (a class) in the same dropdown as "Indoor Pool",
+# "Indoor Lap" and "Indoor Lap Pool", plus one slot with no type at all. Only book
+# something that names itself Indoor: showing up to a water aerobics class is a wrong
+# booking, not a lesser one.
+LANE_TYPE = "indoor"
+
+
+def is_lane(option_text: str) -> bool:
+    return LANE_TYPE in option_text.lower()
+
+
+_SLOT_START_RE = re.compile(r'\s*(\d{1,2}):(\d{2})\s*([ap])\.?m', re.I)
+
+
+def slot_start(option_text: str) -> time_of_day | None:
+    """Start time of a slot like '9:30am - 10:10am Indoor Pool - Free'.
+
+    None when the text does not begin with a parseable time — callers treat that
+    as "cannot confirm", which for the cutoff means skipping the slot rather than
+    risking a booking at an unknown hour.
+    """
+    m = _SLOT_START_RE.match(option_text)
+    if not m:
+        return None
+    hour, minute, meridiem = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+    if hour == 12:
+        hour = 0
+    if meridiem == "p":
+        hour += 12
+    return time_of_day(hour, minute)
+
+
+def choose_slot(options: list[dict], preferences: list[str], avoid: set[str],
+                any_open: bool = True, latest: time_of_day | None = None):
     """Pick a bookable ticket option.
 
-    Walks `preferences` in order, then falls back to the earliest option that is
-    still bookable. Times in `avoid` are skipped entirely - the site has already
-    refused them, so asking again just burns an attempt.
+    Walks `preferences` in order; an exact match always wins and is never subject to
+    the fallback bounds. If no preference is free and `any_open` is set, settles for
+    the earliest remaining lane that starts no earlier than the first preference and
+    no later than `latest`. When `any_open` is not set, books nothing at all: a
+    weekday lane outside 6:15 is useless, so no swim beats the wrong swim.
+
+    Both bounds matter. Without `latest` a busy day silently books an evening lane.
+    Without the lower bound, a grid that starts before the preferred time answers a
+    missing 8:00 with a 6:15 lane — weekday grids demonstrably do start at 6:15, so
+    "earliest open" alone is only safe while every grid happens to start at 8:00.
+
+    Only slots that name themselves as lanes are eligible, in both loops — see
+    `is_lane`. A slot whose start time cannot be parsed is skipped rather than
+    guessed at.
+
+    Times in `avoid` are skipped entirely: the site has already refused them, so
+    asking again just burns an attempt.
 
     Returns (value, option_text, matched_preference) or (None, None, None).
     """
@@ -256,15 +354,77 @@ def choose_slot(options: list[dict], preferences: list[str], avoid: set[str]):
 
     for pref in preferences:
         for o in options:
-            if not o["disabled"] and _norm(pref) in _norm(o["text"]) and not blocked(o["text"]):
-                return o["value"], o["text"], pref
+            if o["disabled"] or blocked(o["text"]) or _norm(pref) not in _norm(o["text"]):
+                continue
+            if not is_lane(o["text"]):
+                # Right time, wrong activity. Logged rather than passed over quietly:
+                # if the site renames its lane tickets this is why booking stopped.
+                log.warning("%s is offered as %r, not a lap lane – skipping",
+                            pref, o["text"].strip())
+                continue
+            return o["value"], o["text"], pref
+
+    if not any_open:
+        return None, None, None
+
+    earliest = slot_start(preferences[0]) if preferences else None
 
     for o in options:
         if o["disabled"] or not o["value"] or o["value"] == "0" or blocked(o["text"]):
             continue
+        if not is_lane(o["text"]):
+            continue
+        start = slot_start(o["text"])
+        if start is None:
+            continue
+        if earliest is not None and start < earliest:
+            continue
+        if latest is not None and start > latest:
+            continue
         return o["value"], o["text"], None
 
     return None, None, None
+
+
+def report_slots(options: list[dict], target_date: date, preferences: list[str],
+                 any_open: bool, latest: time_of_day | None = None) -> None:
+    """Print the real slot grid and what the current config would do with it.
+
+    Used by --dry-run to validate a schedule against the live site before any
+    booking is attempted.
+    """
+    lines = ["", "=" * 62,
+             f"DRY RUN – nothing was booked",
+             f"Target: {target_date.strftime('%A, %B %-d, %Y')}",
+             "=" * 62, "", "Slots offered to Gary:"]
+    for o in options:
+        if not o["value"] or o["value"] == "0":
+            continue
+        note = "" if is_lane(o["text"]) else "   (not a lap lane – never booked)"
+        lines.append(f"   {'OPEN ' if not o['disabled'] else 'taken'}  {o['text']}{note}")
+
+    want = " → ".join(preferences) if preferences else "(none configured)"
+    if not any_open:
+        fb = "NO — book nothing if unavailable"
+    else:
+        bounds = []
+        if preferences:
+            bounds.append(f"nothing earlier than {preferences[0]}")
+        if latest is not None:
+            bounds.append(f"nothing starting after {latest.strftime('%-I:%M %p')}")
+        fb = "yes — " + ("; ".join(bounds) if bounds else "any open lane")
+    lines += ["", f"Configured preference: {want}", f"Fallback: {fb}"]
+
+    value, text, matched = choose_slot(options, preferences, set(),
+                                       any_open=any_open, latest=latest)
+    if value is None:
+        lines.append("Would book: NOTHING — no acceptable slot"
+                     + ("" if any_open else " (fallback disabled for this day)"))
+    else:
+        how = f"matched preference {matched}" if matched else "fallback to earliest acceptable lane"
+        lines.append(f"Would book: {text.split(' Indoor')[0].strip()}   ({how})")
+    lines += ["=" * 62, ""]
+    log.info("\n".join(lines))
 
 
 def classify_result(page_text: str) -> tuple[str | None, bool]:
@@ -301,7 +461,9 @@ def settle(page, selector: str, budget_ms: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
+def book_once(preferences: list[str], avoid: set[str] | None = None,
+              any_open: bool = True, latest: time_of_day | None = None,
+              dry_run: bool = False) -> None:
     avoid = avoid or set()
     target_date = date.today() + timedelta(days=1)
     day_name = target_date.strftime("%A")   # e.g. "Saturday"
@@ -381,15 +543,17 @@ def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
         log.info("On event detail page: %s", event_url)
 
         # ------------------------------------------------------------------
-        # 4. Find 8 AM slot and register
+        # 4. Find the target slot and open the registration wizard
         # ------------------------------------------------------------------
-        # Names the slot we are actually after, which differs from TARGET_TIME once a
-        # pivot has happened. The button choice does not decide the booking - the
-        # wizard dropdown does - so the 8:00 variants stay as the search anchor.
-        log.info("Looking for the %s slot", preferences[0] if preferences else "earliest open")
+        wanted = preferences[0] if preferences else "8:00 AM"
+        log.info("Looking for the %s slot", wanted)
 
-        # Look for a register/book button near the "8:00 AM" / "8:00am" text
-        time_variants = ["8:00 AM", "8:00am", "8:00 am", "8:00AM"]
+        # Anchor the button search on the time we actually want - it is no longer
+        # always 8:00. This only picks which Register button opens the wizard; the
+        # booking itself is decided by the dropdown in step 5, and there is a
+        # catch-all fallback below, so a miss here is not fatal.
+        time_variants = [wanted, wanted.lower().replace(" ", ""),
+                         wanted.lower(), wanted.upper().replace(" ", "")]
         register_btn = None
 
         for variant in time_variants:
@@ -416,17 +580,20 @@ def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
                     log.info("Found register button near '%s'", variant)
                     break
 
-        # Fallback: any Register button on the page
-        if register_btn is None:
+        # Fallback: any Register button on the page - but only while we are genuinely
+        # on an event detail page. On the listing, "any Register button" belongs to
+        # some other event entirely; that is how the 2026-07-28 redirect bug got as
+        # far as opening a stranger's registration wizard instead of failing.
+        if register_btn is None and _EVENT_DETAIL_RE.search(page.url):
             btn = page.locator(
                 "button:has-text('Register'), a:has-text('Register'), input[value='Register']"
             ).first
             if btn.count() > 0:
                 register_btn = btn
-                log.warning("Using fallback register button (could not isolate 8 AM slot)")
+                log.warning("Using fallback register button (could not isolate the %s slot)", wanted)
 
         if register_btn is None:
-            fail(page, f"Could not find a Register button for the {TARGET_TIME} slot")
+            fail(page, f"Could not find a Register button for the {wanted} slot")
 
         register_btn.click()
         page.wait_for_load_state("networkidle")
@@ -449,11 +616,25 @@ def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
         )
         log.info("Gary's ticket options: %s", options)
 
-        selected_value, raw_text, attempted_slot = choose_slot(options, preferences, avoid)
+        if dry_run:
+            # Stop here: the wizard is open but nothing is selected and no Continue
+            # has been clicked, so no reservation can result.
+            report_slots(options, target_date, preferences, any_open, latest)
+            browser.close()
+            return
+
+        selected_value, raw_text, attempted_slot = choose_slot(
+            options, preferences, avoid, any_open=any_open, latest=latest)
         if selected_value is None:
-            # Nothing bookable at all - not even a late slot. Retrying cannot help.
-            fail(page, f"No bookable time slot for {target_date.isoformat()} – all slots sold out",
-                 terminal=True)
+            if not any_open:
+                # Deliberate: a lane outside the preferred time is no use on this day.
+                fail(page, f"{' / '.join(preferences)} unavailable for {target_date.isoformat()} – "
+                           f"not booking a fallback", terminal=True)
+            # Nothing acceptable left. Either everything is gone, or all that remains
+            # starts after the cutoff - both mean retrying cannot help.
+            bound = f" starting by {latest.strftime('%-I:%M %p')}" if latest else ""
+            fail(page, f"No bookable slot{bound} for {target_date.isoformat()} – "
+                       f"nothing suitable available", terminal=True)
 
         booked_slot_text = raw_text.split(" Indoor")[0].strip()
         if attempted_slot is None:
@@ -578,7 +759,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None) -> None:
                 log.warning("Site refused %s as sold out – it will be skipped on retry", refused)
             fail(page, reason, sold_out_slot=refused)
 
-        log.info("SUCCESS – registered for %s %s on %s", TARGET_TIME, EVENT_NAME, target_date.isoformat())
+        log.info("SUCCESS – registered for %s %s on %s", booked_slot_text, EVENT_NAME, target_date.isoformat())
         page.screenshot(path=str(SCREENSHOT_FILE))
 
         # ------------------------------------------------------------------
@@ -642,7 +823,32 @@ def trim_log() -> None:
     LOG_FILE.write_text("".join(kept))
 
 
+def schedule_for(target_date: date, weekday_recon: bool = False) -> DaySchedule | None:
+    """The plan for the day being booked, or None if we do not swim that day."""
+    if weekday_recon and target_date.weekday() not in SCHEDULE:
+        return WEEKDAY_SCHEDULE
+    return SCHEDULE.get(target_date.weekday())
+
+
 def main() -> None:
+    dry_run = "--dry-run" in sys.argv
+    target_date = date.today() + timedelta(days=1)
+    # A dry run is for inspecting a day we do not yet book, so fall back to the
+    # candidate weekday plan rather than refusing to look.
+    plan = schedule_for(target_date, weekday_recon=dry_run)
+
+    if plan is None:
+        log.info("Nothing scheduled for %s – exiting without booking",
+                 target_date.strftime("%A, %B %-d"))
+        return
+
+    if dry_run:
+        log.info("DRY RUN – will read the slot grid for %s and book nothing",
+                 target_date.strftime("%A, %B %-d"))
+        book_once(list(plan.preferences), any_open=plan.any_open,
+                  latest=plan.latest, dry_run=True)
+        return
+
     # Start clean so a screenshot from an earlier run can never be attached as if it
     # were evidence from this one.
     SCREENSHOT_FILE.unlink(missing_ok=True)
@@ -650,17 +856,17 @@ def main() -> None:
     last_exc: BaseException | None = None
     last_tb = ""
     attempts_used = 0
-    # First attempt chases 8:00 exactly as before. Once the site confirms a time is
-    # sold out, it is dropped so the remaining attempts pivot to the next choice
+    # First attempt chases the day's first preference. Once the site confirms a time
+    # is sold out, it is dropped so the remaining attempts pivot to the next choice
     # instead of re-submitting a booking the site has already refused.
-    preferences = [TARGET_TIME, FALLBACK_TIME]
+    preferences = list(plan.preferences)
     avoid: set[str] = set()
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts_used = attempt
         try:
             log.info("Attempt %d/%d", attempt, MAX_ATTEMPTS)
-            book_once(preferences, avoid)
+            book_once(preferences, avoid, any_open=plan.any_open, latest=plan.latest)
             trim_log()
             return
         except Exception as exc:
