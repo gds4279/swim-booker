@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -76,6 +76,11 @@ DRY_RUN_PROBE = DaySchedule(["6:15 AM"], any_open=False)
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
 SCREENSHOT_FILE = BASE_DIR / "last_run.png"
+# The first failure is the one worth looking at; later attempts usually fail for a
+# downstream reason. `last_run.png` is overwritten on every attempt, so on 2026-07-29
+# the only picture of the attempt that mattered was destroyed by four retries and the
+# failure email shipped attempt 5's screenshot - which showed the booking succeeding.
+FIRST_FAILURE_FILE = BASE_DIR / "first_failure.png"
 MAX_ATTEMPTS = 5
 # The 8:00 slot has been observed selling out ~30-90s after it opens, and a retry
 # costs ~25s of login and navigation on its own. Keep the extra idle wait short.
@@ -108,7 +113,8 @@ log = logging.getLogger(__name__)
 # Email
 # ---------------------------------------------------------------------------
 
-def send_email(subject: str, body: str, attachment_path: Path | None = None) -> None:
+def send_email(subject: str, body: str,
+               attachment_path: Path | Iterable[Path] | None = None) -> None:
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
@@ -116,12 +122,20 @@ def send_email(subject: str, body: str, attachment_path: Path | None = None) -> 
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    if attachment_path and attachment_path.exists():
-        with open(attachment_path, "rb") as f:
+    # A failure can be worth two pictures - the first attempt's page and the last -
+    # so this takes either one path or several. Missing files are skipped silently:
+    # an absent attachment is clearer than a stale one.
+    paths = [attachment_path] if isinstance(attachment_path, Path) else list(attachment_path or [])
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        with open(path, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
         encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={attachment_path.name}")
+        part.add_header("Content-Disposition", f"attachment; filename={path.name}")
         msg.attach(part)
 
     try:
@@ -168,6 +182,10 @@ def fail(page, reason: str, terminal: bool = False, sold_out_slot: str | None = 
     try:
         page.screenshot(path=str(SCREENSHOT_FILE))
         log.info("Screenshot saved to %s", SCREENSHOT_FILE)
+        # Keep the first failure of the run as well. Retries overwrite last_run.png,
+        # and the attempt that actually went wrong is nearly always the first one.
+        if not FIRST_FAILURE_FILE.exists():
+            FIRST_FAILURE_FILE.write_bytes(SCREENSHOT_FILE.read_bytes())
     except Exception:
         # Leave no stale screenshot behind - an absent attachment is clearer
         # evidence than one left over from a previous run.
@@ -452,6 +470,113 @@ def classify_result(page_text: str) -> tuple[str | None, bool]:
     return matched_error, succeeded
 
 
+# Every element the registration wizard renders carries an `event-registration*`
+# class. Scoping to it is not a nicety: the event page rendered around the wizard
+# lists the entire ticket grid - "(Sold Out)" beside every gone slot, and a "Ticket
+# Purchased" heading once you hold a ticket - so a page-wide wait for those words is
+# answered by furniture. Measured 2026-07-29 on the plain event page: 15 visible
+# matches, 13 of them "(Sold Out)" price rows.
+REGISTRATION_SCOPE = ".event-registration, [class*='event-registration']"
+
+
+def registration_text(page) -> str:
+    """All text inside the registration wizard, or "" when it is not on the page.
+
+    Reads every matching node instead of `.first`. That union selector matched 41
+    elements on a live event page and the first in DOM order was
+    `.event-registration__title` - a heading holding the event name and nothing
+    else, which contains no verdict and so reads as failure no matter what
+    happened. Joining them all also keeps this working whichever wrapper class the
+    site happens to use for a given wizard step.
+    """
+    try:
+        return "\n".join(page.locator(REGISTRATION_SCOPE).all_inner_texts()).strip()
+    except Exception:
+        return ""
+
+
+def await_verdict(page, budget_ms: int = 8000) -> str:
+    """Poll the wizard until its own text says something decisive, then return it.
+
+    An empty or still-rendering wizard is *not* a verdict. On 2026-07-29 the result
+    was read 822ms after submitting, because the page-wide wait it replaced was
+    satisfied instantly by the ticket grid behind the modal. The wizard had not
+    painted its confirmation yet, so a booking the site had already accepted - and
+    emailed about - was reported as "Not on confirmation page".
+
+    Returns whatever the wizard says once the budget runs out, so an inconclusive
+    read still reaches the event-page check rather than blocking.
+    """
+    deadline = time.monotonic() + budget_ms / 1000
+    while True:
+        text = registration_text(page)
+        if classify_result(text) != (None, False):
+            return text
+        if time.monotonic() >= deadline:
+            log.warning("Wizard gave no verdict within %.1fs – falling back to the event page",
+                        budget_ms / 1000)
+            return text
+        page.wait_for_timeout(250)
+
+
+# The site prints the ticket a member holds on the event page itself, as a heading
+# followed by the slot:
+#
+#     Ticket Purchased
+#     6:15am-6:55am Indoor Pool
+#     $0.00
+#
+# This is the authoritative record - it survives the wizard, and it names the slot.
+_PURCHASED_RE = re.compile(r"^[ \t]*Ticket Purchased[ \t]*$\n+[ \t]*(\S.*?)[ \t]*$",
+                           re.IGNORECASE | re.MULTILINE)
+
+
+def purchased_slot(page) -> str | None:
+    """The slot Gary already holds on the event page currently loaded, if any.
+
+    Trusted over anything the wizard says. The wizard reports on one submission and
+    can be misread mid-render; this is the site's own answer to "what do I hold?",
+    read from a settled page, and it is what proves a retry would double-book.
+    """
+    try:
+        m = _PURCHASED_RE.search(page.inner_text("body"))
+    except Exception:
+        return None
+    return m.group(1).strip() if m else None
+
+
+def capture(page) -> None:
+    """Screenshot the current page as this run's evidence, best effort.
+
+    Used by the success paths that never reach the wizard's confirmation page, so
+    the email still carries a picture - here, the event page showing the ticket.
+    """
+    try:
+        page.screenshot(path=str(SCREENSHOT_FILE))
+    except Exception:
+        log.warning("Could not capture screenshot:\n%s", traceback.format_exc())
+
+
+def check_event_page(page, event_url: str) -> str | None:
+    """Reload the event page and return the ticket Gary holds there, or None.
+
+    Wraps `purchased_slot` with the navigation and the "never raise" contract its
+    callers need: this runs on paths where the booking may already be made, so a
+    thrown exception here must not turn a real reservation into a retry.
+    """
+    try:
+        page.goto(event_url, wait_until="networkidle")
+        held = purchased_slot(page)
+    except Exception:
+        log.warning("Event-page check failed to run:\n%s", traceback.format_exc())
+        return None
+    if held:
+        log.info("Event page confirms a ticket: %s", held)
+    else:
+        log.warning("Event page shows no ticket for this event")
+    return held
+
+
 def settle(page, selector: str, budget_ms: int) -> None:
     """Wait for `selector` to appear, giving up after `budget_ms`.
 
@@ -472,7 +597,6 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
               dry_run: bool = False) -> None:
     avoid = avoid or set()
     target_date = date.today() + timedelta(days=1)
-    day_name = target_date.strftime("%A")   # e.g. "Saturday"
     booked_slot_text = None  # set only once a specific slot option is actually selected
     attempted_slot = None    # which preference we committed to, for sold-out reporting
     verified = False         # set if the reservation is confirmed on a fresh page load
@@ -549,6 +673,28 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         log.info("On event detail page: %s", event_url)
 
         # ------------------------------------------------------------------
+        # 3b. Stop if this event is already booked
+        # ------------------------------------------------------------------
+        # Free: we are standing on the event page anyway. This is what keeps a
+        # misread confirmation from becoming four more bookings. On 2026-07-29 the
+        # site itself refused the duplicates - but only because the wizard drops
+        # Gary's member row once he holds a ticket. On a weekend, where a fallback
+        # is enabled, there is no such guarantee: a retry could book a second lane
+        # at a different time and the earlier one would never be released.
+        held = purchased_slot(page)
+        if held:
+            log.info("Already registered for %s – not re-entering the wizard", held)
+            if dry_run:
+                browser.close()
+                return
+            capture(page)
+            report_success(target_date, held, verified=True,
+                           note="\nNOTE: the ticket was already held when this attempt started, "
+                                "so an earlier attempt booked it.\n")
+            browser.close()
+            return
+
+        # ------------------------------------------------------------------
         # 4. Find the target slot and open the registration wizard
         # ------------------------------------------------------------------
         wanted = preferences[0] if preferences else "8:00 AM"
@@ -610,6 +756,19 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         # Target Gary's specific member row (not the whole form, not Dawn's row)
         gary_row = page.locator("li.event-registration__members-row").filter(has_text="Gary").first
         if gary_row.count() == 0:
+            # The wizard stops offering a member row once that member holds a ticket,
+            # so "no row" is as often proof of success as it is a failure. Ask the
+            # event page which it is before reporting anything. (Contrast 2026-07-03,
+            # where attempt 1 genuinely failed and attempt 2 still found the row.)
+            held = check_event_page(page, event_url)
+            if held and not dry_run:
+                log.warning("No member row because the ticket is already held: %s", held)
+                capture(page)
+                report_success(target_date, held, verified=True,
+                               note="\nNOTE: the wizard offered no member row because this "
+                                    "ticket was already booked.\n")
+                browser.close()
+                return
             fail(page, "Ticket selection step never appeared – no member row for Gary")
 
         log.info("Ticket selection step detected – targeting Gary's member row")
@@ -724,8 +883,12 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
                         }
                     }""")
                 page.wait_for_load_state("networkidle")
-                # Step 3 renders either the confirmation or an error - either ends the wait
-                settle(page, "text=/Ticket Purchased|Unable to complete|sold out/i", 2000)
+                # Step 3 renders either the confirmation or an error. Do NOT wait on a
+                # page-wide selector here either - the same furniture that defeated the
+                # old wait in step 8 defeats it here. await_verdict in step 8 is the
+                # real wait; this is only a short head start before the confirm button
+                # is looked for.
+                page.wait_for_timeout(500)
 
         # ------------------------------------------------------------------
         # 7. Confirm if a confirmation dialog/button appears
@@ -742,21 +905,29 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         # ------------------------------------------------------------------
         # 8. Verify success
         # ------------------------------------------------------------------
-        settle(page, "text=/Ticket Purchased|Unable to complete|sold out/i", 2000)
+        # Wait on the wizard's own text, never a page-wide selector - see await_verdict.
+        page_text = await_verdict(page)
         log.info("Final page URL: %s", page.url)
 
-        # Read the registration modal rather than the whole body: generic phrases like
-        # "thank you" live in page furniture (footers, banners) and would otherwise
-        # read as a booking confirmation.
-        scope = page.locator(".event-registration, [class*='event-registration']").first
-        if scope.count() > 0:
-            page_text = scope.inner_text()
-        else:
-            log.warning("Registration modal not found – falling back to full body text")
-            page_text = page.inner_text("body")
         matched_error, succeeded = classify_result(page_text)
         if not succeeded:
             reason = f"Registration error: {matched_error}" if matched_error else "Not on confirmation page"
+            # The wizard is not the last word. Before failing, ask the site what Gary
+            # actually holds: on 2026-07-29 the booking had gone through and been
+            # confirmed by email while this path was reporting failure. An explicit
+            # error phrase is trusted as-is - it is a real answer, not a silence.
+            if matched_error is None:
+                held = check_event_page(page, event_url)
+                if held:
+                    log.warning("Wizard page was unreadable, but the event page shows "
+                                "a ticket for %s – treating as booked", held)
+                    booked_slot_text = booked_slot_text or held
+                    capture(page)
+                    report_success(target_date, booked_slot_text, verified=True,
+                                   note="\nNOTE: the wizard's confirmation page could not be read; "
+                                        "this booking was confirmed from the event page instead.\n")
+                    browser.close()
+                    return
             # A slot that looked open in the dropdown can still be gone by submission -
             # report which one so the retry stops asking for it. Not terminal: another
             # time may well still be free.
@@ -772,26 +943,34 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         # 9. Independently confirm the reservation actually persisted
         # ------------------------------------------------------------------
         # The wizard rendering a confirmation is not proof the booking stuck - reload
-        # the event page and look for the reservation. This never fails the run: the
+        # the event page and look for the ticket. This never fails the run: the
         # booking is already made, and a retry here could double-book.
-        try:
-            page.goto(event_url, wait_until="networkidle")
-            registered_text = page.inner_text("body").lower()
-            verified = "registered" in registered_text or "cancel registration" in registered_text
-            if verified:
-                log.info("Verified: reservation is present on a fresh load of the event page")
-            else:
-                log.warning("Could NOT independently verify the reservation on the event page")
-        except Exception:
-            log.warning("Independent verification step failed to run:\n%s", traceback.format_exc())
+        held = check_event_page(page, event_url)
+        verified = held is not None
+        if verified and booked_slot_text and _norm(held).split("indoor")[0] != _norm(booked_slot_text):
+            log.warning("Event page shows %r but %r was selected – reporting what the site says",
+                        held, booked_slot_text)
+            booked_slot_text = held
 
         browser.close()
 
-    # Reaching here without a slot means the verification above let something through
-    # that it should not have - refuse to claim a booking we cannot name.
+    report_success(target_date, booked_slot_text, verified)
+
+
+def report_success(target_date: date, booked_slot_text: str | None,
+                   verified: bool, note: str = "") -> None:
+    """Send the success email and Slack message.
+
+    Its own function because success can now be reached three ways: the wizard
+    confirming, the event page showing the ticket after an unreadable wizard, and
+    finding the ticket already held before a retry re-enters the wizard.
+    """
+    # Reaching here without a slot means verification let something through that it
+    # should not have - refuse to claim a booking we cannot name.
     if not booked_slot_text:
         raise BookingError("Reported success but no time slot was ever selected")
 
+    day_name = target_date.strftime("%A")
     verify_note = ("" if verified else
                    "\nNOTE: the confirmation page was shown, but reloading the event page "
                    "did not show the reservation. Worth checking manually.\n")
@@ -803,7 +982,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
             f"Event:  {EVENT_NAME}\n"
             f"Date:   {target_date.strftime('%A, %B %-d, %Y')}\n"
             f"Time:   {booked_slot_text}\n"
-            f"{verify_note}"
+            f"{note}{verify_note}"
         ),
         attachment_path=SCREENSHOT_FILE,
     )
@@ -862,6 +1041,7 @@ def main() -> None:
     # Start clean so a screenshot from an earlier run can never be attached as if it
     # were evidence from this one.
     SCREENSHOT_FILE.unlink(missing_ok=True)
+    FIRST_FAILURE_FILE.unlink(missing_ok=True)
 
     last_exc: BaseException | None = None
     last_tb = ""
@@ -900,13 +1080,18 @@ def main() -> None:
 
     reason = str(last_exc) if last_exc else "unknown error"
     log.error("Giving up after %d attempt(s)", attempts_used)
+    # Both pictures: the first attempt's page is where the cause usually is, the last
+    # one is what the site ended up showing. Sending only the last is how the
+    # 2026-07-29 failure email came to carry a screenshot of a successful booking.
     send_email(
         subject=f"[Swim Booker] FAILED – {reason[:60]}",
         body=(
             f"Swim lane booking failed after {attempts_used} attempt(s).\n\n"
-            f"Last error: {reason}\n\n{last_tb}"
+            f"Last error: {reason}\n\n"
+            f"Attached: first_failure.png (attempt 1) and last_run.png (attempt "
+            f"{attempts_used}).\n\n{last_tb}"
         ),
-        attachment_path=SCREENSHOT_FILE,
+        attachment_path=[FIRST_FAILURE_FILE, SCREENSHOT_FILE],
     )
     send_slack(f":x: *Swim booking FAILED* after {attempts_used} attempt(s) — {reason[:120]}")
     trim_log()

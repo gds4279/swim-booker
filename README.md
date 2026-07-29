@@ -8,7 +8,7 @@ Automated script to book an indoor lap pool lane at MyTrilogyLife.com for the ne
 2. Navigates to the Events page and finds the "Indoor Lap Pool Reservation" event for tomorrow
 3. Clicks Register, selects the preferred slot for Gary's member row
 4. Completes the 3-step wizard (Tickets → Payments → Confirmation)
-5. Verifies the confirmation page was reached
+5. Verifies the booking — first from the wizard, then from the event page, which prints the ticket you hold and is the authority if the two disagree
 6. Sends an email (with CC) and a Slack notification with the result and a screenshot
 7. Prunes log entries older than 30 days
 
@@ -102,6 +102,7 @@ On every run (success or failure) the script sends:
 | `.env` | Credentials (not committed) |
 | `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
 | `last_run.png` | Screenshot of the final page, success or failure (removed at the start of each run) |
+| `first_failure.png` | Screenshot of the *first* failed attempt, kept intact while retries overwrite `last_run.png`. Failure emails attach both |
 
 ## Configuration
 
@@ -129,6 +130,12 @@ Key constants at the top of `book_swim.py`:
 - **`never appeared on the events page`**: The matcher requires a single link naming both the event and the
   date. This is deliberately strict; it will not fall back to guessing a nearby link, because doing so was
   found to return a *different day's* event. Check whether the site renamed the event series.
+- **FAILED email but Trilogy says you're booked**: This was the 2026-07-29 bug and is now handled — the script
+  checks the event page for a `Ticket Purchased` heading before failing, and again before every retry, so a
+  misread confirmation no longer becomes a false failure or a duplicate booking. If it recurs, the event page
+  is what to trust; check `first_failure.png` rather than `last_run.png`, which retries overwrite.
+- **`no member row for Gary`**: Usually means the ticket is already held — the wizard stops offering a member
+  row once a member has one. The script now verifies that against the event page instead of retrying.
 - **Login fails**: Check credentials in `.env`
 - **Booking fails**: Review `swim_booker.log` and `last_run.png`. The failure email carries the real
   traceback; if it ever reads `NoneType: None`, `traceback.format_exc()` has been moved outside its
