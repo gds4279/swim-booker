@@ -33,7 +33,14 @@ Only lanes count. The dropdown also lists `Water Fitness`, which is a class, not
 python3 book_swim.py --dry-run
 ```
 
-Logs in, opens the wizard far enough to read the slot grid, prints it along with what the current config *would* book, and exits without selecting anything. Start it before 07:58 and it goes through the full opening-bell hold — the only way to see a grid before the day sells out.
+Logs in, opens the wizard far enough to read the slot grid, prints it along with what the current config *would* book, and exits without selecting anything. It sends no notifications. Start it before 07:58 and it goes through the full opening-bell hold — the only way to see a grid before the day sells out.
+
+If tomorrow is already booked, the dry run reports the slot you hold and stops there rather than reading a grid — the site stops offering a member row once you have a ticket:
+
+```
+On event detail page: https://members.mytrilogylife.com/events/1849593
+Already registered for 6:15am-6:55am Indoor Pool – not re-entering the wizard
+```
 
 ## Setup
 
@@ -89,8 +96,10 @@ This runs at 7:58 AM on Monday (books Tuesday), Wednesday (books Thursday), Frid
 
 On every run (success or failure) the script sends:
 
-- **Email** — to `NOTIFY_EMAIL`, CC'd to `dbutler06@comcast.net`, with a screenshot attached
+- **Email** — to `NOTIFY_EMAIL`, CC'd to `dbutler06@comcast.net`. Success mails attach `last_run.png`; failure mails attach `first_failure.png` and `last_run.png`, so the attempt that actually went wrong is not buried under four retries
 - **Slack** — a message to the configured webhook channel
+
+Both name the **slot actually booked**, read back from the site rather than assumed from the config. If the booking was confirmed from the event page instead of the wizard's confirmation screen, the email says so in a `NOTE:` line.
 
 ## Files
 

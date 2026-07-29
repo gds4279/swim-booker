@@ -1,8 +1,8 @@
 # TODO — weekday 6:15 AM expansion
 
-**Status: done and live as of 2026-07-28.** Tue/Thu 6:15 AM booking is enabled in
-`SCHEDULE` and in cron. Nothing is outstanding; what follows is what to watch and why
-things are the way they are.
+**Status: done and live as of 2026-07-28**, and confirmed booking on 2026-07-29.
+Tue/Thu 6:15 AM booking is enabled in `SCHEDULE` and in cron. Nothing is outstanding;
+what follows is what to watch and why things are the way they are.
 
 ```cron
 58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
@@ -15,32 +15,40 @@ things are the way they are.
 | Friday | Saturday | 8:00 → 8:45, else a later lane between 8:00 and 9:30 |
 | Saturday | Sunday | same as Friday |
 
-## Watch the first live weekday run
+## First live weekday run: 2026-07-29 — booked, but reported as failed
 
-**Wednesday, 07:58 → books Thursday.** (Monday is the other weekday trigger.) In
-`swim_booker.log`, expect the hold at the bell, the grid, then either a 6:15 booking
-or:
+Wednesday 07:58 → Thursday 7/30. **The booking worked**: `6:15am-6:55am Indoor Pool`,
+reached at 08:00:14 and submitted at 08:00:20. Trilogy sent its confirmation email.
+The 6:15 lane was open at the bell, which settles the question the weekday expansion
+was waiting on — early weekday lanes are attainable.
+
+The script then emailed `FAILED after 5 attempt(s)`. Fixed in `5c74c25`; the reasoning
+is in CLAUDE.md under "The wizard is not the last word" and "Never wait on a page-wide
+selector". In short:
+
+- Both waits for confirmation text used a **page-wide** selector, and the event page
+  around the wizard already contains every phrase they waited for — `(Sold Out)` on
+  each gone slot, and a `Ticket Purchased` heading once you hold a ticket. 15 visible
+  matches, measured. So the wait returned instantly and the verdict was read 822ms
+  after submitting, before the wizard had painted.
+- Attempts 2–5 then died on `no member row for Gary`, which is what the wizard shows
+  once you *already hold a ticket*. The proof of success was reported as the cause of
+  failure.
+
+**Still worth watching: the first weekend run under these changes** (Friday 07:58 →
+Saturday). The weekend path has a fallback enabled, so a misread confirmation there
+was the case that could have produced a genuine double-booking rather than four
+harmless refusals.
+
+If a weekday 6:15 is ever really gone, expect:
 
 ```
-6:15 AM unavailable for 2026-07-30 – not booking a fallback
+6:15 AM unavailable for <date> – not booking a fallback
 ```
 
-**That second message is the design working, not a bug.** It is a `terminal` failure,
-so it stops retrying immediately rather than burning ~30s per pointless attempt, and
-it sends a failure email and Slack message.
-
-Grid evidence from 2026-07-28 (Wednesday's event, read at 08:05, five minutes after
-publish, on a day already flagged `ALMOST FULL`):
-
-```
-OPEN   6:15am-6:55am Indoor Pool - Free
-OPEN   7:00am-7:40am Indoor Pool - Free
-taken  7:45am-8:25am Water Fitness - Free
-taken  8:30am-9:10am Indoor Pool - Free
-```
-
-Early-morning weekday lanes look genuinely attainable — better than Monday's
-sold-out-in-eight-minutes reading suggested.
+**That message is the design working, not a bug.** It is a `terminal` failure, so it
+stops retrying immediately rather than burning ~30s per pointless attempt, and it
+sends a failure email and Slack message.
 
 ## Decisions — do not re-litigate
 
@@ -64,6 +72,14 @@ sold-out-in-eight-minutes reading suggested.
   check. If it stops matching, fail loudly and find out why.
 - **`Water Fitness` is a class, not a lane**, and shares the dropdown with lanes. The
   `LANE_TYPE` filter applies to preferred times too, not just fallbacks.
+- **The event page outranks the wizard.** `Ticket Purchased` on the event page is the
+  site's own answer to "what do I hold?", and it names the slot. It decides before the
+  wizard opens, on a missing member row, and before failing on an unreadable wizard.
+  Do not let a retry re-enter the wizard without that check: on a weekend the fallback
+  would happily book a second lane at another time, and the first is never released.
+- **Never wait on a page-wide selector for confirmation text.** The ticket grid behind
+  the wizard answers it instantly. Wait on the wizard's own text, and treat an
+  unpainted wizard as *no verdict yet* rather than as failure.
 
 ## Cron numbering
 

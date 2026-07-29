@@ -673,7 +673,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         log.info("On event detail page: %s", event_url)
 
         # ------------------------------------------------------------------
-        # 3b. Stop if this event is already booked
+        # 4. Stop if this event is already booked
         # ------------------------------------------------------------------
         # Free: we are standing on the event page anyway. This is what keeps a
         # misread confirmation from becoming four more bookings. On 2026-07-29 the
@@ -695,7 +695,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
             return
 
         # ------------------------------------------------------------------
-        # 4. Find the target slot and open the registration wizard
+        # 5. Find the target slot and open the registration wizard
         # ------------------------------------------------------------------
         wanted = preferences[0] if preferences else "8:00 AM"
         log.info("Looking for the %s slot", wanted)
@@ -751,7 +751,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         page.wait_for_load_state("networkidle")
 
         # ------------------------------------------------------------------
-        # 5. Handle ticket selection wizard (1.Tickets → 2.Payments → 3.Confirmation)
+        # 6. Handle ticket selection wizard (1.Tickets → 2.Payments → 3.Confirmation)
         # ------------------------------------------------------------------
         # Target Gary's specific member row (not the whole form, not Dawn's row)
         gary_row = page.locator("li.event-registration__members-row").filter(has_text="Gary").first
@@ -838,7 +838,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
             settle(page, "input[type='checkbox']", 1500)
 
         # ------------------------------------------------------------------
-        # 6. Handle payments/agreement step if present (step 2 of wizard)
+        # 7. Handle payments/agreement step if present (step 2 of wizard)
         # ------------------------------------------------------------------
         agree_cb = page.locator("input[type='checkbox']").first
         if agree_cb.count() > 0:
@@ -891,7 +891,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
                 page.wait_for_timeout(500)
 
         # ------------------------------------------------------------------
-        # 7. Confirm if a confirmation dialog/button appears
+        # 8. Confirm if a confirmation dialog/button appears
         # ------------------------------------------------------------------
         confirm_btn = page.locator(
             "button:has-text('Confirm'), button:has-text('Yes'), "
@@ -903,7 +903,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
             page.wait_for_load_state("networkidle")
 
         # ------------------------------------------------------------------
-        # 8. Verify success
+        # 9. Verify success
         # ------------------------------------------------------------------
         # Wait on the wizard's own text, never a page-wide selector - see await_verdict.
         page_text = await_verdict(page)
@@ -940,7 +940,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         page.screenshot(path=str(SCREENSHOT_FILE))
 
         # ------------------------------------------------------------------
-        # 9. Independently confirm the reservation actually persisted
+        # 10. Independently confirm the reservation actually persisted
         # ------------------------------------------------------------------
         # The wizard rendering a confirmation is not proof the booking stuck - reload
         # the event page and look for the ticket. This never fails the run: the
