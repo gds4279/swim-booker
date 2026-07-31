@@ -149,9 +149,12 @@ Key constants at the top of `book_swim.py`:
 - **Booking fails**: Review `swim_booker.log` and `last_run.png`. The failure email carries the real
   traceback; if it ever reads `NoneType: None`, `traceback.format_exc()` has been moved outside its
   `except` block again.
-- **Missed the 8:00 slot**: Check how late the log's dropdown read is versus 08:00:00. The job starts at
-  7:58 so only the event-listing fetch happens after the bell; arriving much past ~08:00:05 means the
-  listing was slow, and `EVENT_LISTING_PATIENCE` is the knob.
+- **Missed the 8:00 slot**: Check how late the log's dropdown read is versus 08:00:00. Reaching it around
+  **08:00:18–20 is normal** — the site does not publish tomorrow's event at 08:00:00, it lands around
+  08:00:08–14, and rendering the wizard costs another ~6s. `EVENT_LISTING_PATIENCE` is the knob, and it is
+  a real margin rather than slack. Starting the job earlier will not help: it is already logged in and
+  waiting at the gate. The clocks are not the problem either — the server's clock was measured against ours
+  on 2026-07-31 and agrees to within 0.02s.
 - **Email not sent**: Confirm `SMTP_APP_PASSWORD` is a Gmail App Password, not your login password
 - **Slack not posting**: Confirm `SLACK_WEBHOOK_URL` is set in `.env` and the webhook is active
 - **All slots disabled**: The 8 AM slot may already be taken; the script falls back to 8:45 AM, then the

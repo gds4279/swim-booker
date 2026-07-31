@@ -121,7 +121,25 @@ The cron day numbers and the `SCHEDULE` keys are the same digits (1, 3, 5, 6), w
 
 **The job starts early on purpose.** Registration opens at 08:00:00 and the 8:00 slot has been seen selling out within ~7s of that. Logging in takes ~16s and used to happen *after* the window opened, so the script reached the ticket dropdown a median of **25s late** (measured across 10 logged runs).
 
-The events list does not publish tomorrow's event until 08:00 either, so that fetch cannot be front-loaded — but the login can. The script now logs in by ~7:58:16, holds at the gate, and at 08:00:00 has only the listing fetch and Register click left, reaching the dropdown around 08:00:05.
+The events list does not publish tomorrow's event until 08:00 either, so that fetch cannot be front-loaded — but the login can. The script logs in by ~7:58:16 and holds at the gate, leaving only the listing fetch and Register click for 08:00:00.
+
+**Where the remaining ~20s goes, measured on two runs (2026-07-29 and 2026-07-31, near-identical):**
+
+| | 07-29 | 07-31 |
+|---|---|---|
+| Gate opens | 08:00:00.000 | 08:00:00.001 |
+| Listing check 1 — not listed | 08:00:04.083 | 08:00:03.970 |
+| Listing check 2 — not listed | 08:00:08.266 | 08:00:07.787 |
+| Listing check 3 — event appears | 08:00:14.350 | 08:00:14.078 |
+| Dropdown read | 08:00:18.527 | 08:00:20.373 |
+
+**The site does not publish the event at 08:00:00.** It lands somewhere around 08:00:08–14; the Register-click-to-wizard render costs another ~6s. Neither is script overhead, which is why `EVENT_LISTING_PATIENCE = 20` is load-bearing rather than slack — 07-31 used 14 of its 20 seconds. Starting the job even earlier cannot help: it is already logged in and waiting.
+
+The early start still bought real time. Dropdown arrival was 08:00:23–32 across the nine runs that started at 07:59:59, and 08:00:18–20 on the two that started at 07:58.
+
+**Clock skew is not a factor — do not go looking for it again.** Measured 2026-07-31 against the server's own HTTP `Date` header, sampling on a keep-alive connection and catching the instant its second ticks over (a single sample only bounds the offset to ±1s, the transition brackets it to ~±0.15s): median offset **−0.017s** over 26 boundaries, range −0.18s to +0.08s, i.e. inside the measurement error. Both clocks are right. `members.mytrilogylife.com` is Apache with no CDN in front, so that `Date` is the application server's own clock, not an edge cache's. The local box is NTP-synced (`timedatectl`: `System clock synchronized: yes`).
+
+Each re-check is a full `page.goto(EVENTS_URL, wait_until="networkidle")` costing ~3.5–4s, so the `wait_for_timeout(400)` between checks is not what sets the polling interval — the fetch is. That means publication can go unnoticed for up to ~4s after it happens (on 07-31 the event appeared somewhere in the 6.3s between checks 2 and 3). A lighter `wait_until` for the re-checks is the one place left where a few seconds could realistically be won.
 
 Event IDs are **not** predictable, so the listing fetch cannot be skipped by guessing the URL: consecutive weekend days were +1 apart three times but +5 on 2026-07-04→07-05, and week-to-week jumps run into the thousands.
 

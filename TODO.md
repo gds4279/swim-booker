@@ -81,6 +81,23 @@ sends a failure email and Slack message.
   the wizard answers it instantly. Wait on the wizard's own text, and treat an
   unpainted wizard as *no verdict yet* rather than as failure.
 
+## Timing — settled, 2026-07-31
+
+The dropdown is reached ~08:00:18–20. That is **not** fixable by starting earlier:
+
+- Clocks agree. The server's HTTP `Date` was sampled against ours by catching its
+  second boundary: median offset **−0.017s** over 26 boundaries (range −0.18 to
+  +0.08, inside the ±0.15s measurement bracket). No CDN in front, so that is the
+  application server's clock. Local box is NTP-synced. **Do not re-investigate this.**
+- The site publishes tomorrow's event around **08:00:08–14**, not at 08:00:00.
+- Register-click to wizard render costs another ~6s.
+
+The one place seconds could still be won: each listing re-check is a full
+`page.goto(..., wait_until="networkidle")` at ~4s, so publication can go unnoticed for
+up to ~4s. A lighter `wait_until` for re-checks would tighten that. Not done — it
+touches the most time-critical path in the script and every slot was still open at
+08:00:20 on 07-31, so there is no evidence it is needed yet.
+
 ## Cron numbering
 
 Cron day numbers (1, 3, 5, 6) and `SCHEDULE` keys (1, 3, 5, 6) are the same digits by
