@@ -56,12 +56,15 @@ class DaySchedule(NamedTuple):
 
 
 SCHEDULE: dict[int, DaySchedule] = {
-    # Weekdays: 6:15 is the only lane that still gets Gary to work on time, so there
-    # is no fallback at all - any later lane is useless and a "booked" email for one
-    # is worse than a failure notice. Grid confirmed 2026-07-28 against Wednesday's
-    # event: "6:15am-6:55am Indoor Pool - Free", open.
-    1: DaySchedule(["6:15 AM"], any_open=False),   # Tuesday
-    3: DaySchedule(["6:15 AM"], any_open=False),   # Thursday
+    # Weekdays: the first lane of the day is the only one that still gets Gary to work
+    # on time, so there is no fallback at all - any later lane is useless and a
+    # "booked" email for one is worse than a failure notice.
+    # The site re-gridded the weekday morning between 2026-07-29 and 2026-08-03: it
+    # ran 6:15/7:00/7:45/8:30 and now runs 6:00/6:45/7:30/8:15. Confirmed 2026-08-03
+    # against both Monday's and Tuesday's events. This time is site-side, not a
+    # preference - re-read the grid before changing it.
+    1: DaySchedule(["6:00 AM"], any_open=False),   # Tuesday
+    3: DaySchedule(["6:00 AM"], any_open=False),   # Thursday
     # Weekends: a later swim is still a swim, but not at any hour - without the
     # cutoff a busy Saturday could quietly book an 8:30 PM lane and call it success.
     # The fallback floor is 8:00 AM: choose_slot derives it from preferences[0], so
@@ -72,7 +75,7 @@ SCHEDULE: dict[int, DaySchedule] = {
 
 # The plan --dry-run assumes for a day we do not book, so recon is possible on any
 # day of the week. Not used by real runs: every day we actually book is in SCHEDULE.
-DRY_RUN_PROBE = DaySchedule(["6:15 AM"], any_open=False)
+DRY_RUN_PROBE = DaySchedule(["6:00 AM"], any_open=False)
 
 LOG_FILE = BASE_DIR / "swim_booker.log"
 SCREENSHOT_FILE = BASE_DIR / "last_run.png"
@@ -236,10 +239,19 @@ def wait_until_open() -> bool:
 # the listing only publishes at 08:00 and the 8:00 slot can be gone by 08:00:07.
 _FIND_EVENT_JS = r"""
 ([name, d1, d2]) => {
-  const wanted = name.toLowerCase();
+  // Event titles are hand-typed by the club, so their punctuation cannot be relied
+  // on: Tuesday 8/4/2026 was published as "Tuesday August, 4" while Monday the same
+  // morning read "Monday, August 3". Comparing raw substrings missed it entirely and
+  // the 2026-08-03 run failed with "never appeared on the events page". Both sides
+  // are reduced to lowercase words separated by single spaces before comparing, so
+  // stray commas, pipes and double spaces stop mattering. The token boundaries are
+  // what keep "august 4" from matching "august 14" or "august 40".
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const wanted = norm(name), dates = [norm(d1), norm(d2)];
+  const hasDate = hay => dates.some(d => d && new RegExp('(^| )' + d + '( |$)').test(hay));
 
-  // The match must come from a single anchor that names both the event and the date
-  // and points at an event *detail* page. There used to be a broader fallback that
+  // A match must come from a single anchor that names both the event and the date and
+  // points at an event *detail* page. There used to be a broader fallback that
   // scanned td/li/div for a container mentioning both, then took an anchor from it.
   // It cannot work: querySelectorAll returns outermost-first, so the first "match" is
   // a whole-page wrapper, and the anchor it yields is unrelated to the date that
@@ -248,13 +260,23 @@ _FIND_EVENT_JS = r"""
   // which is worse: a plausible URL that books the wrong day. Verified 2026-07-28
   // against Thursday 7/30, which resolved to Tuesday's event 1849591.
   // If this ever stops matching, fail loudly rather than reinstating a guess.
+  //
+  // Every match is returned, not just the first: the club splits a single day across
+  // more than one event (Tuesday 8/4/2026 ran 6:00AM-8:55AM and 10:00AM-5:00PM as
+  // separate listings), and only one of them holds the slot we want. Which to open is
+  // decided in Python by order_candidates, on the anchor's own text.
+  const out = [], seen = new Set();
   for (const a of document.querySelectorAll('a')) {
     const t = a.innerText || '';
-    if (!t.toLowerCase().includes(wanted)) continue;
-    if (!t.includes(d1) && !t.includes(d2)) continue;
-    if (a.href && /\/events\/\d+/.test(a.href)) return a.href;
+    const n = norm(t);
+    if (!n.includes(wanted)) continue;
+    if (!hasDate(n)) continue;
+    if (!a.href || !/\/events\/\d+/.test(a.href)) continue;
+    if (seen.has(a.href)) continue;
+    seen.add(a.href);
+    out.push({href: a.href, text: t.replace(/\s+/g, ' ').trim()});
   }
-  return null;
+  return out;
 }
 """
 
@@ -264,8 +286,12 @@ _FIND_EVENT_JS = r"""
 _EVENT_DETAIL_RE = re.compile(r"/events/\d+")
 
 
-def find_event_href(page, target_date: date) -> str | None:
-    """Load the events list and return tomorrow's event href, or None if not listed."""
+def find_event_candidates(page, target_date: date) -> list[dict]:
+    """Load the events list and return every listing for tomorrow's event.
+
+    Usually one. The club has published a single day as two separate events, so the
+    caller must choose - see `order_candidates`.
+    """
     page.goto(EVENTS_URL, wait_until="networkidle")
     return page.evaluate(_FIND_EVENT_JS, [
         EVENT_NAME,
@@ -274,7 +300,28 @@ def find_event_href(page, target_date: date) -> str | None:
     ])
 
 
-def open_event_page(page, target_date: date, patience: float = 0.0) -> str | None:
+def order_candidates(candidates: list[dict], preferences: list[str]) -> list[dict]:
+    """Put the listings that advertise a preferred time first, DOM order otherwise.
+
+    On 2026-08-03 Tuesday was published as two events - "6:00AM-8:55AM" and
+    "10:00AM-5:00PM" - and only the first holds the 6:00 lane. Each listing's own
+    text carries its window, so the choice costs nothing: no extra page load, and a
+    day published as one event is unaffected.
+
+    This only decides which page to open. What actually gets booked is still decided
+    by `choose_slot` against the real dropdown, so a wrong guess here cannot book the
+    wrong time - it can only fail to find the right one. That is why an unrecognised
+    set of windows keeps DOM order rather than dropping anything.
+    """
+    if len(candidates) < 2 or not preferences:
+        return candidates
+    wanted = [_norm(p) for p in preferences]
+    return sorted(candidates,
+                  key=lambda c: not any(w in _norm(c.get("text", "")) for w in wanted))
+
+
+def open_event_page(page, target_date: date, patience: float = 0.0,
+                    preferences: list[str] | None = None) -> str | None:
     """Open tomorrow's event detail page. Returns its URL, or None if not listed.
 
     The listing only publishes at 08:00:00, and the publish may land a moment after
@@ -294,14 +341,22 @@ def open_event_page(page, target_date: date, patience: float = 0.0) -> str | Non
     checks = 0
     while True:
         checks += 1
-        href = find_event_href(page, target_date)
-        if href:
-            page.goto(href, wait_until="networkidle")
-            if _EVENT_DETAIL_RE.search(page.url):
-                if checks > 1:
-                    log.info("Event appeared on check %d", checks)
-                return page.url
-            reason = f"link redirected to {page.url} – not open yet"
+        candidates = order_candidates(find_event_candidates(page, target_date),
+                                      preferences or [])
+        if candidates:
+            if len(candidates) > 1:
+                log.info("%d listings match %s – trying them in order: %s",
+                         len(candidates), target_date.isoformat(),
+                         ", ".join(c["href"] for c in candidates))
+            # Every candidate already names the event and the date, so any of them is
+            # a legitimate page for this day; try the next only when one redirects.
+            for candidate in candidates:
+                page.goto(candidate["href"], wait_until="networkidle")
+                if _EVENT_DETAIL_RE.search(page.url):
+                    if checks > 1:
+                        log.info("Event appeared on check %d", checks)
+                    return page.url
+                reason = f"link redirected to {page.url} – not open yet"
         else:
             reason = "not listed yet"
         if time.monotonic() >= deadline:
@@ -649,7 +704,7 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         event_url = None
         if seconds_until_open() > 0:
             try:
-                event_url = open_event_page(page, target_date)
+                event_url = open_event_page(page, target_date, preferences=preferences)
                 if event_url is None:
                     log.info("Event not published yet, as expected – will fetch when the window opens")
             except Exception:
@@ -664,7 +719,8 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
             log.info("Refreshing the event page now that registration is open")
             page.goto(event_url, wait_until="networkidle")
         else:
-            event_url = open_event_page(page, target_date, patience=EVENT_LISTING_PATIENCE)
+            event_url = open_event_page(page, target_date, patience=EVENT_LISTING_PATIENCE,
+                                        preferences=preferences)
 
         if event_url is None:
             fail(page, f"'{EVENT_NAME}' for {target_date.strftime('%-m/%-d/%Y')} never appeared "

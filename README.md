@@ -20,12 +20,14 @@ Runs automatically at **7:58 AM every Monday, Wednesday, Friday and Saturday** v
 
 | Run day | Day booked | Prefers | If unavailable |
 |---|---|---|---|
-| Monday | Tuesday | 6:15 AM | Books **nothing** — a later weekday lane misses the start of the work day |
-| Wednesday | Thursday | 6:15 AM | Books **nothing** |
+| Monday | Tuesday | 6:00 AM | Books **nothing** — a later weekday lane misses the start of the work day |
+| Wednesday | Thursday | 6:00 AM | Books **nothing** |
 | Friday | Saturday | 8:00 AM, then 8:45 AM | The next open lane, **no earlier than 8:00 AM** and **no later than 9:30 AM** |
 | Saturday | Sunday | 8:00 AM, then 8:45 AM | Same |
 
 Only lanes count. The dropdown also lists `Water Fitness`, which is a class, not a lane; it is never booked, even at a preferred time.
+
+These times track the club's own grid and it does change — the weekday morning moved from `6:15/7:00/7:45/8:30` to `6:00/6:45/7:30/8:15` on 2026-08-03. If a weekday run starts reporting nothing bookable, run `--dry-run` and compare `SCHEDULE` against the grid it prints.
 
 ### Dry run
 
@@ -39,7 +41,7 @@ If tomorrow is already booked, the dry run reports the slot you hold and stops t
 
 ```
 On event detail page: https://members.mytrilogylife.com/events/1849593
-Already registered for 6:15am-6:55am Indoor Pool – not re-entering the wizard
+Already registered for 6:00am-6:40am Indoor Pool – not re-entering the wizard
 ```
 
 ## Setup
@@ -119,8 +121,8 @@ Key constants at the top of `book_swim.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SCHEDULE` | Tue/Thu 6:15; Sat/Sun 8:00 → 8:45 | What to book per day, keyed on the weekday being booked (Mon=0 … Sun=6) |
-| `DRY_RUN_PROBE` | `6:15 AM`, no fallback | The plan `--dry-run` assumes for a day not in `SCHEDULE`; never used by a real run |
+| `SCHEDULE` | Tue/Thu 6:00; Sat/Sun 8:00 → 8:45 | What to book per day, keyed on the weekday being booked (Mon=0 … Sun=6) |
+| `DRY_RUN_PROBE` | `6:00 AM`, no fallback | The plan `--dry-run` assumes for a day not in `SCHEDULE`; never used by a real run |
 | `EVENT_NAME` | `"Indoor Lap Pool Reservation"` | Event to search for. Singular on purpose — weekday events use the singular, weekend ones the plural, and this stem matches both |
 | `LANE_TYPE` | `"indoor"` | A slot must contain this to count as a lap lane (filters out `Water Fitness`) |
 | `MAX_ATTEMPTS` | `5` | Retry attempts before giving up (terminal errors stop immediately) |
@@ -136,9 +138,16 @@ Key constants at the top of `book_swim.py`:
 - **Nothing booked but slots looked open**: Likely the lane filter. `Water Fitness` entries are classes and
   are never booked; neither is anything starting earlier than the first preference or after the cutoff.
   Run `--dry-run` — it annotates each row with why it was ignored.
-- **`never appeared on the events page`**: The matcher requires a single link naming both the event and the
-  date. This is deliberately strict; it will not fall back to guessing a nearby link, because doing so was
-  found to return a *different day's* event. Check whether the site renamed the event series.
+- **`never appeared on the events page`**: The matcher requires a link naming both the event and the date.
+  It is deliberately strict about *which* link counts — it will not guess at a nearby one, because doing so
+  was found to return a *different day's* event. It is deliberately loose about *punctuation*, because the
+  club types these titles by hand: on 2026-08-03 Tuesday was published as `Tuesday August, 4` (comma in the
+  wrong place) and the run failed for an event that was plainly listed. Both sides are now compared as
+  lowercase words. If this recurs, open the events page in a browser and read the title character by
+  character before touching anything else.
+- **`unavailable … not booking a fallback` on a weekday**: First check the grid, not the code. The club
+  re-timed the weekday morning on 2026-08-03 — `6:15/7:00/7:45/8:30` became `6:00/6:45/7:30/8:15` — so the
+  configured time simply stopped existing. `--dry-run` prints the real grid; update `SCHEDULE` to match.
 - **FAILED email but Trilogy says you're booked**: This was the 2026-07-29 bug and is now handled — the script
   checks the event page for a `Ticket Purchased` heading before failing, and again before every retry, so a
   misread confirmation no longer becomes a false failure or a duplicate booking. If it recurs, the event page

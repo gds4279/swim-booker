@@ -10,8 +10,10 @@ What it books is driven by `SCHEDULE`, keyed on the weekday of the day being **b
 
 | Day booked | Prefers | If unavailable |
 |---|---|---|
-| Tuesday, Thursday | 6:15 AM | Books **nothing**. Any later lane misses the start of the work day, so a "booked" email for one is worse than a failure notice |
+| Tuesday, Thursday | 6:00 AM | Books **nothing**. Any later lane misses the start of the work day, so a "booked" email for one is worse than a failure notice |
 | Saturday, Sunday | 8:00 AM → 8:45 AM | A later lane, **no earlier than 8:00 AM** and **no later than 9:30 AM** |
+
+**These times are the site's grid, not a preference.** The club re-timed the weekday morning between 2026-07-29 and 2026-08-03: it ran `6:15/7:00/7:45/8:30` and now runs `6:00/6:45/7:30/8:15`. `6:15 AM` stopped existing and, with `any_open=False`, that is a terminal failure — the correct behaviour, but it books nothing. Re-read a real grid (`--dry-run`) before changing these, and expect to do it again.
 
 `--dry-run` logs in, opens the wizard far enough to read Gary's slot dropdown, prints the grid and what the current config *would* book, then exits without selecting anything. It never books, and it never sends a notification. Started before 08:00 it goes through the full opening-bell hold, which is the only way to see a grid before the day sells out. If the day is already booked it says so and exits at step 4 — there is no grid to read, since the wizard stops offering a member row once the ticket is held.
 
@@ -62,7 +64,7 @@ Everything lives in `book_swim.py`. The flow inside `book_once()`:
 
 Success is reachable three ways — the wizard confirming, the event page showing the ticket after an unreadable wizard, and finding the ticket already held at step 4 — so the success email and Slack message live in `report_success()` rather than at the end of `book_once()`. The two paths that never see a wizard confirmation call `capture()` first, so the notification still carries a screenshot: the event page showing the ticket. `report_success()` is also where the "refuse to claim a booking we cannot name" check lives, which is why every caller must pass a real slot string.
 
-**The wizard is not the last word — the event page is.** The site prints what a member holds on the event page itself, as a `Ticket Purchased` heading followed by the slot (`6:15am-6:55am Indoor Pool`). `purchased_slot()` parses exactly that, and it is the authority in three places:
+**The wizard is not the last word — the event page is.** The site prints what a member holds on the event page itself, as a `Ticket Purchased` heading followed by the slot (`6:00am-6:40am Indoor Pool`). `purchased_slot()` parses exactly that, and it is the authority in three places:
 
 - **Before the wizard** (step 4). If the ticket is already held, `book_once()` reports success and returns without opening the wizard. This is what stops a misread confirmation becoming a second booking. On 2026-07-29 the site itself refused the four duplicate attempts — but only because the wizard drops Gary's member row once he holds a ticket. On a weekend, where a fallback is enabled, a retry could book a *second* lane at a different time and the first would never be released.
 - **On "no member row for Gary."** That message is as often proof of success as it is a failure, so the event page decides which. (Contrast 2026-07-03, where attempt 1 genuinely failed and attempt 2 still found the row.)
@@ -84,12 +86,16 @@ Success is reachable three ways — the wizard confirming, the event page showin
 **Choosing a slot.** `choose_slot()` enforces three rules, all of which have cost a real run:
 
 - **Lap lanes only.** Not every ticket in a lap-pool event is lap swimming — the weekday grid also offers `Water Fitness` (a class) in the same dropdown, plus one slot with no type at all. `is_lane()` requires `LANE_TYPE` (`"indoor"`) in the option text, and it applies to preference matches too, not just fallbacks: a `Water Fitness` ticket at exactly 8:00 AM is the wrong booking, not a lesser one. A preference rejected on type logs a warning, so a site-side rename surfaces as a reason rather than a silence.
-- **Fallback never goes earlier than the first preference.** Weekday grids start at 6:15 AM, so an unbounded "earliest open slot" answers a gone 8:00 with a 6:15 lane. The lower bound is derived from `preferences[0]`; it preserves what "earliest open" always meant back when every grid happened to start at 8:00.
+- **Fallback never goes earlier than the first preference.** Weekday grids start at 6:00 AM, so an unbounded "earliest open slot" answers a gone 8:00 with a 6:00 lane. The lower bound is derived from `preferences[0]`; it preserves what "earliest open" always meant back when every grid happened to start at 8:00.
 - **Fallback never goes later than `latest`** (9:30 AM on weekends). Without it a busy Saturday quietly books an 8:30 PM lane and calls it success.
 
 A slot whose start time will not parse is skipped, never guessed at. When `any_open` is false (weekdays) the fallback loop does not run at all.
 
 **The event matcher must not guess.** `_FIND_EVENT_JS` matches only a **single anchor** whose own text names both the event and the date and whose href is `/events/<id>`. There used to be a broader fallback that scanned `td, li, div` for a container mentioning both and took an anchor from it. It cannot work: `querySelectorAll` returns outermost-first, so the first "match" is a whole-page wrapper and the anchor it yields has nothing to do with the date that matched. It returned the top-nav **EVENTS** link (`/events`) for an unopened day — and once restricted to `/events/<id>` links it returned *a different day's event*, which is worse, because a plausible URL books the wrong day. Verified 2026-07-28: Thursday 7/30 resolved to Tuesday's event `1849591`. **If this ever stops matching, fail loudly rather than reinstating a guess.**
+
+**But it must not be brittle about punctuation, either.** Event titles are typed by hand at the club, so their formatting is not stable: on 2026-08-03 Tuesday 8/4 was published as `Tuesday August, 4` while Monday, the same morning, read `Monday, August 3`. A raw `includes("August 4")` missed it, and every attempt failed with `never appeared on the events page` for an event that was sitting right there. Both sides are now reduced to lowercase words separated by single spaces (`[^a-z0-9]+` → `" "`) before comparing, so stray commas, pipes and double spaces stop mattering. The comparison keeps token boundaries — `(^| )august 4( |$)` — which is what stops `August 4` matching `August 14` or `August 40`. **Being strict about which anchor counts and being tolerant of how the club types a date are different things; do not tighten the second to protect the first.**
+
+**One day can be several events.** `_FIND_EVENT_JS` returns *every* matching anchor, not the first. On 2026-08-03 Tuesday was published as two separate listings — `6:00AM-8:55AM` (`1853228`) and `10:00AM-5:00PM` (`1849598`) — and only the first holds the 6:00 lane. `order_candidates()` (pure, unit-tested) sorts the candidates so those whose own listing text advertises a preferred time come first, and otherwise leaves DOM order alone. It reads the listing text the browser already returned, so it costs no extra page load, and a day published as a single event is unaffected. Nothing is ever dropped: this only picks which page to *open*, and `choose_slot()` still decides what gets *booked* against the real dropdown — so a bad ranking can only fail to find the right slot, never book the wrong one.
 
 `open_event_page()` independently re-checks that it actually landed on `/events/<id>` before returning a URL. Returning `page.url` unvalidated is what broke the 2026-07-28 run: `event_url` became the bare listing URL, which is not `None`, so the caller treated the listing as the event page, refreshed *it* at 08:00:00 and clicked a Register button belonging to an unrelated event. Both layers are deliberate — one stops a wrong URL being produced, the other stops a wrong URL being used.
 
@@ -99,13 +105,13 @@ A slot whose start time will not parse is skipped, never guessed at. When `any_o
 
 | Variable | Value | Notes |
 |---|---|---|
-| `SCHEDULE` | `{1, 3, 5, 6}` | What to book, keyed on the weekday **being booked** (Mon=0 … Sun=6). Tue/Thu: `["6:15 AM"]`, `any_open=False`. Sat/Sun: `["8:00 AM", "8:45 AM"]`, `any_open=True`, `latest=9:30 AM` |
-| `DRY_RUN_PROBE` | `["6:15 AM"]`, `any_open=False` | The plan `--dry-run` assumes for a day not in `SCHEDULE`, so recon works on any day. Never used by a real run |
+| `SCHEDULE` | `{1, 3, 5, 6}` | What to book, keyed on the weekday **being booked** (Mon=0 … Sun=6). Tue/Thu: `["6:00 AM"]`, `any_open=False`. Sat/Sun: `["8:00 AM", "8:45 AM"]`, `any_open=True`, `latest=9:30 AM` |
+| `DRY_RUN_PROBE` | `["6:00 AM"]`, `any_open=False` | The plan `--dry-run` assumes for a day not in `SCHEDULE`, so recon works on any day. Never used by a real run |
 | `EVENT_NAME` | `"Indoor Lap Pool Reservation"` | **Singular on purpose** — weekday events are titled `…Reservation`, weekend ones `…Reservations`. The singular stem is a substring of both. Do not "correct" it |
 | `LANE_TYPE` | `"indoor"` | Substring an option must contain to count as a lap lane, filtering out `Water Fitness` |
 | `MAX_ATTEMPTS` | `5` | Total tries before giving up |
 | `RETRY_DELAY` | `3` | Seconds between retries (kept short — the 8:00 slot sells out 30–90s after opening) |
-| `OPEN_TIME` | `08:00:00` | When registration opens — *not* a swim time. Confirmed from the site's own text: "Reservations may be made at 8:00am the day prior." The two were the same number while this was weekend-only; 6:15 decoupled them. Never "fix" it to a swim time |
+| `OPEN_TIME` | `08:00:00` | When registration opens — *not* a swim time. Confirmed from the site's own text: "Reservations may be made at 8:00am the day prior." The two were the same number while this was weekend-only; the 6:00 weekday lane decoupled them. Never "fix" it to a swim time |
 | `MAX_PREOPEN_WAIT` | `900` | Safety cap on that hold, so an ad-hoc early run never blocks for hours |
 | `EVENT_LISTING_PATIENCE` | `20.0` | Seconds to keep re-checking for the event listing after 08:00, since it publishes at the bell |
 
