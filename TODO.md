@@ -94,8 +94,9 @@ rule, which is his call, not a translation of the old config.
   the day prior."* Never "fix" it to a swim time.
 - **`EVENT_NAME` is singular on purpose** — a substring of both the weekday
   (`…Reservation`) and weekend (`…Reservations`) titles. Do not "correct" it.
-- **The event matcher does not guess.** It requires a single anchor naming both the
-  event and the date, with an `/events/<id>` href. Do not reinstate a nearest-anchor
+- **The event matcher does not guess.** Every match must come from one anchor that
+  names both the event and the date itself, with an `/events/<id>` href — never from a
+  container, never inferred from a neighbour. Do not reinstate a nearest-anchor
   fallback: it returned the top-nav EVENTS link, and once restricted to event links,
   returned *a different day's event* — verified 2026-07-28, Thursday 7/30 resolving
   to Tuesday's `1849591`. A plausible URL that books the wrong day beats any URL

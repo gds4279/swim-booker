@@ -5,7 +5,7 @@ Automated script to book an indoor lap pool lane at MyTrilogyLife.com for the ne
 ## How It Works
 
 1. Logs into MyTrilogyLife.com using stored credentials
-2. Navigates to the Events page and finds the "Indoor Lap Pool Reservation" event for tomorrow
+2. Navigates to the Events page and finds the "Indoor Lap Pool Reservation" event for tomorrow. The club sometimes publishes one day as two events (a morning and an afternoon listing), so when more than one matches, the script opens the one advertising the time it wants
 3. Clicks Register, selects the preferred slot for Gary's member row
 4. Completes the 3-step wizard (Tickets → Payments → Confirmation)
 5. Verifies the booking — first from the wizard, then from the event page, which prints the ticket you hold and is the authority if the two disagree
