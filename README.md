@@ -29,6 +29,25 @@ Only lanes count. The dropdown also lists `Water Fitness`, which is a class, not
 
 These times track the club's own grid and it does change — the weekday morning moved from `6:15/7:00/7:45/8:30` to `6:00/6:45/7:30/8:15` on 2026-08-03. If a weekday run starts reporting nothing bookable, run `--dry-run` and compare `SCHEDULE` against the grid it prints.
 
+### Saved login session
+
+Since 2026-10-14 the login form is gated by reCAPTCHA, which refuses this server's browser (`Score does not meet threshold`). So the script reuses a session from a login you did yourself, and only falls back to the form if that session has stopped working.
+
+To create or refresh it:
+
+1. In your own browser, log in at mytrilogylife.com with **Remember Me** ticked.
+2. On `members.mytrilogylife.com`, export the cookies — e.g. the Cookie-Editor extension → *Export* → *JSON* — and save them to a file on this machine.
+3. Import and verify:
+
+   ```bash
+   python3 book_swim.py --import-cookies cookies.json
+   rm cookies.json   # it is a credential; the script keeps its own copy
+   ```
+
+It prints whether the session is logged in. `python3 book_swim.py --check-session` re-checks at any time. Neither books anything or sends notifications. The session lives in `session.json` (mode 600, gitignored) and is refreshed after every successful run. A raw `Cookie:` header copied from DevTools (Network tab → any members-site request) also works as the import file.
+
+If a run logs `Saved session is no longer logged in` followed by a reCAPTCHA failure, repeat the steps above.
+
 ### Dry run
 
 ```bash
@@ -154,7 +173,10 @@ Key constants at the top of `book_swim.py`:
   is what to trust; check `first_failure.png` rather than `last_run.png`, which retries overwrite.
 - **`no member row for Gary`**: Usually means the ticket is already held — the wizard stops offering a member
   row once a member has one. The script now verifies that against the event page instead of retrying.
-- **Login fails**: Check credentials in `.env`
+- **Login fails with `Score does not meet threshold`**: The site's reCAPTCHA bot check (added by
+  2026-10-14) refuses this server's browser — credentials are fine. The script logs in with a saved session
+  instead; refresh it as described under *Saved login session*.
+- **Login fails otherwise**: Check credentials in `.env`
 - **Booking fails**: Review `swim_booker.log` and `last_run.png`. The failure email carries the real
   traceback; if it ever reads `NoneType: None`, `traceback.format_exc()` has been moved outside its
   `except` block again.

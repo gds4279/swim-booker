@@ -84,6 +84,13 @@ SCREENSHOT_FILE = BASE_DIR / "last_run.png"
 # the only picture of the attempt that mattered was destroyed by four retries and the
 # failure email shipped attempt 5's screenshot - which showed the booking succeeding.
 FIRST_FAILURE_FILE = BASE_DIR / "first_failure.png"
+# A logged-in browser session (Playwright storage_state: cookies), reused so a run
+# skips the login form. Since 2026-10-14 the form is gated by reCAPTCHA v3, which
+# scores this server's fresh headless browser as a bot and refuses it - headed,
+# un-flagged and human-paced input all failed too. A session from a real login
+# (with "Remember Me") gets past it; `--import-cookies` creates the file. It is a
+# credential: written 0600 and gitignored.
+SESSION_FILE = BASE_DIR / "session.json"
 MAX_ATTEMPTS = 5
 # The 8:00 slot has been observed selling out ~30-90s after it opens, and a retry
 # costs ~25s of login and navigation on its own. Keep the extra idle wait short.
@@ -647,6 +654,145 @@ def settle(page, selector: str, budget_ms: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+_SAME_SITE = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+
+
+def cookies_to_storage_state(raw: str) -> dict:
+    """Turn a browser cookie export into a Playwright storage_state dict.
+
+    Accepts the JSON array that Cookie-Editor / EditThisCookie export, or a raw
+    `Cookie:` header (`name=value; name2=value2`) copied from DevTools, whose
+    cookies are scoped to the members site. Pure, so it can be tested offline.
+    """
+    raw = raw.strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw[len("cookie:"):].strip()
+    cookies = []
+    if raw.startswith("[") or raw.startswith("{"):
+        data = json.loads(raw)
+        if isinstance(data, dict):           # already a storage_state
+            data = data.get("cookies", [])
+        for c in data:
+            expires = c.get("expirationDate", c.get("expires"))
+            same_site = _SAME_SITE.get(str(c.get("sameSite") or "").lower(), "Lax")
+            cookies.append({
+                "name": c["name"], "value": c["value"],
+                "domain": c["domain"], "path": c.get("path") or "/",
+                # -1 is Playwright's "session cookie"
+                "expires": float(expires) if expires not in (None, "") and not c.get("session") else -1,
+                "httpOnly": bool(c.get("httpOnly", False)),
+                # SameSite=None is only valid on a secure cookie
+                "secure": bool(c.get("secure", False)) or same_site == "None",
+                "sameSite": same_site,
+            })
+    else:
+        for part in raw.split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name:
+                cookies.append({"name": name, "value": value,
+                                "domain": "members.mytrilogylife.com", "path": "/",
+                                "expires": -1, "httpOnly": False, "secure": True,
+                                "sameSite": "Lax"})
+    cookies = [c for c in cookies if "mytrilogylife.com" in c["domain"]]
+    if not cookies:
+        raise ValueError("no mytrilogylife.com cookies found in that export")
+    return {"cookies": cookies, "origins": []}
+
+
+def load_session() -> dict | None:
+    """The saved session, or None. A missing or corrupt file just means 'log in'."""
+    try:
+        state = json.loads(SESSION_FILE.read_text())
+        # new_context() raises on a malformed storage_state, which would fail every
+        # attempt before the login form could rescue it - so check the shape here.
+        if isinstance(state, dict) and isinstance(state.get("cookies"), list):
+            return state
+    except FileNotFoundError:
+        return None
+    except Exception:
+        pass
+    log.warning("Saved session %s is unreadable – ignoring it", SESSION_FILE.name)
+    return None
+
+
+def write_session(state: dict) -> None:
+    """Atomically write SESSION_FILE, created 0600 so it is never world-readable."""
+    tmp = SESSION_FILE.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        json.dump(state, f)
+    tmp.replace(SESSION_FILE)
+
+
+def save_session(context) -> None:
+    """Persist the context's cookies so the next run can skip the login form.
+
+    Called after every successful login: the site rotates its session cookie, and
+    a stale copy would expire sooner. Never allowed to break a run.
+    """
+    try:
+        write_session(context.storage_state())
+    except Exception:
+        log.warning("Could not save the session:\n%s", traceback.format_exc())
+
+
+def session_is_live(page) -> bool:
+    """True if this browser is already logged in to the members site.
+
+    Asking for the events list is the test: logged out, the site redirects to
+    /login (verified 2026-10-14). Swallows errors - a broken check means "log in".
+    """
+    try:
+        page.goto(EVENTS_URL, wait_until="networkidle")
+        return "/login" not in page.url and page.locator('input[type="password"]').count() == 0
+    except Exception:
+        log.warning("Session check failed:\n%s", traceback.format_exc())
+        return False
+
+
+def log_in_with_form(page) -> None:
+    """Log in through the site's form. Calls fail() if it does not get through."""
+    log.info("Navigating to %s", LOGIN_URL)
+    page.goto(LOGIN_URL, wait_until="networkidle")
+
+    try:
+        # Click the "LOG IN HERE" button on the homepage
+        page.click('a:has-text("LOG IN HERE"), a:has-text("Log In Here"), button:has-text("LOG IN HERE")')
+        page.wait_for_load_state("networkidle")
+    except PlaywrightTimeoutError:
+        fail(page, "Could not find or click the LOG IN HERE button")
+
+    try:
+        # Fill username and password fields
+        page.wait_for_selector('input[type="password"]', timeout=15000)
+        page.fill('input[name="username"], input[id*="user"], input[placeholder*="Username" i], input[type="text"]', USERNAME)
+        page.fill('input[name="password"], input[type="password"]', PASSWORD)
+        # "Remember Me" gets a long-lived cookie, so the session save_session() keeps
+        # outlasts the short browser session. Optional - never fail a login over it.
+        try:
+            page.check('input[type="checkbox"][name*="remember" i]', timeout=2000)
+        except Exception:
+            log.info("No 'Remember Me' checkbox found – continuing without it")
+        login_url = page.url
+        page.click('button[type="submit"], input[type="submit"], button:has-text("Log In"), button:has-text("Sign In"), button:has-text("Submit")')
+        # Wait for navigation away from the login page
+        page.wait_for_url(lambda url: url != login_url, timeout=20000)
+        page.wait_for_load_state("networkidle")
+    except PlaywrightTimeoutError:
+        # The login form reports its own refusals. "Score does not meet threshold." is
+        # the site's reCAPTCHA v3 bot check rejecting this browser, not bad credentials
+        # (first seen 2026-10-14) - name what the site said rather than guessing.
+        try:
+            body = page.inner_text("body", timeout=2000)
+        except Exception:
+            body = ""
+        if "score does not meet threshold" in body.lower():
+            fail(page, "Login rejected by the site's reCAPTCHA bot check "
+                       "('Score does not meet threshold') – not a credentials problem. "
+                       "Refresh the saved session: python3 book_swim.py --import-cookies <export>")
+        fail(page, "Timed out after submitting login – credentials may be wrong or page did not redirect")
+
+
 def book_once(preferences: list[str], avoid: set[str] | None = None,
               any_open: bool = True, latest: time_of_day | None = None,
               dry_run: bool = False) -> None:
@@ -664,36 +810,20 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         # sync_playwright()'s __exit__ stops the driver and tears down any browser it
         # launched, on the exception path too - no explicit close needed for cleanup.
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        context = browser.new_context(storage_state=load_session())
         page = context.new_page()
 
         # ------------------------------------------------------------------
-        # 1. Login
+        # 1. Login - reuse the saved session if it is still good, else the form
         # ------------------------------------------------------------------
-        log.info("Navigating to %s", LOGIN_URL)
-        page.goto(LOGIN_URL, wait_until="networkidle")
-
-        try:
-            # Click the "LOG IN HERE" button on the homepage
-            page.click('a:has-text("LOG IN HERE"), a:has-text("Log In Here"), button:has-text("LOG IN HERE")')
-            page.wait_for_load_state("networkidle")
-        except PlaywrightTimeoutError:
-            fail(page, "Could not find or click the LOG IN HERE button")
-
-        try:
-            # Fill username and password fields
-            page.wait_for_selector('input[type="password"]', timeout=15000)
-            page.fill('input[name="username"], input[id*="user"], input[placeholder*="Username" i], input[type="text"]', USERNAME)
-            page.fill('input[name="password"], input[type="password"]', PASSWORD)
-            login_url = page.url
-            page.click('button[type="submit"], input[type="submit"], button:has-text("Log In"), button:has-text("Sign In"), button:has-text("Submit")')
-            # Wait for navigation away from the login page
-            page.wait_for_url(lambda url: url != login_url, timeout=20000)
-            page.wait_for_load_state("networkidle")
-        except PlaywrightTimeoutError:
-            fail(page, "Timed out after submitting login – credentials may be wrong or page did not redirect")
-
-        log.info("Login successful")
+        if SESSION_FILE.exists() and session_is_live(page):
+            log.info("Logged in via saved session – skipped the login form")
+        else:
+            if SESSION_FILE.exists():
+                log.warning("Saved session is no longer logged in – falling back to the login form")
+            log_in_with_form(page)
+            log.info("Login successful")
+        save_session(context)
 
         # ------------------------------------------------------------------
         # 2/3. Stage, hold for the opening bell, then grab the event page
@@ -1076,7 +1206,41 @@ def schedule_for(target_date: date, probe: bool = False) -> DaySchedule | None:
     return SCHEDULE.get(target_date.weekday())
 
 
+def check_session() -> bool:
+    """Report whether the saved session is logged in. Books nothing, notifies no one."""
+    if load_session() is None:
+        log.error("No usable saved session at %s", SESSION_FILE)
+        return False
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(storage_state=load_session())
+        live = session_is_live(context.new_page())
+        if live:
+            save_session(context)
+            log.info("Saved session is logged in – runs will skip the login form")
+        else:
+            log.error("Saved session is NOT logged in – export fresh cookies and re-import")
+        browser.close()
+    return live
+
+
+def import_cookies(path: str) -> bool:
+    """Write SESSION_FILE from a browser cookie export, then check it works."""
+    state = cookies_to_storage_state(Path(path).read_text())
+    write_session(state)
+    log.info("Imported %d cookie(s) into %s", len(state["cookies"]), SESSION_FILE.name)
+    return check_session()
+
+
 def main() -> None:
+    if "--import-cookies" in sys.argv:
+        i = sys.argv.index("--import-cookies")
+        if i + 1 >= len(sys.argv):
+            sys.exit("usage: book_swim.py --import-cookies <cookie-export-file>")
+        sys.exit(0 if import_cookies(sys.argv[i + 1]) else 1)
+    if "--check-session" in sys.argv:
+        sys.exit(0 if check_session() else 1)
+
     dry_run = "--dry-run" in sys.argv
     target_date = date.today() + timedelta(days=1)
     # A dry run is for inspecting any day, including ones we do not book.
