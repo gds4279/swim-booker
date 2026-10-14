@@ -181,3 +181,17 @@ Both email and Slack are sent on every run (success and failure).
 - `last_run.png` — the final page, whether success or failure. Deleted at the start of every run and if capture fails, so a notification never carries a stale screenshot from a previous run as if it were evidence.
 - `session.json` — the saved login session (cookies). A credential: created mode 600 via `write_session()`, gitignored. Rewritten after every successful login; a missing, corrupt or logged-out file just means the form login is tried.
 - `first_failure.png` — a copy of `last_run.png` taken at the **first** `fail()` of the run and not overwritten afterwards. Retries overwrite `last_run.png`, and the attempt that actually went wrong is nearly always the first: on 2026-07-29 four retries destroyed the only picture of the attempt that mattered, and the failure email shipped attempt 5's screenshot — which showed the `REGISTERED` badge and an `UNREGISTER` button, i.e. the booking succeeding. The failure email now attaches **both**.
+
+## Claude Code Tooling (`.claude/`)
+
+**Guard hook** — `.claude/hooks/guard.py`, registered as a PreToolUse hook in `.claude/settings.json` for Bash, Read, Edit, Write, NotebookEdit and Grep. It denies:
+- a live run: `book_swim.py` executed without `--dry-run` / `--check-session` / `--import-cookies`, any `run.sh`, or code that imports `book_swim` and calls `main()`, `book_once()` (unless `dry_run=True`), `send_email()`, `send_slack()` or `report_success()`;
+- touching a credential: any Bash command that *mentions* the dotenv file, the saved session or its `.tmp`, and any file tool aimed at them.
+
+It matches command **text**, so it errs toward blocking: a grep of the docs for the session file's name, or a commit message naming those files or functions, is refused too. Work with it, not around it — write commit messages to a scratch file and `git commit -F` it; spell a search term as `session[.]json`. When a live run is genuinely wanted, the user runs it (`! ./run.sh`). A crash in the guard itself lets the command through (default `onFailure`), so a guard bug cannot freeze the project. `.claude/settings.local.json` holds personal permission rules and is gitignored.
+
+**Skills** — `/postmortem [YYYY-MM-DD]` diagnoses a run: pulls it out of the log (`scripts/run_log.py`), reads the screenshots, establishes whether a lane is actually booked *before* diagnosing, and classifies against a table of known failure signatures. `/grid-check` runs `--check-session` then `--dry-run` and judges the live grid against `SCHEDULE` and the last confirmed grids kept in its `SKILL.md`. Both skill files are the place to record a new failure signature or a confirmed grid change — keep them current alongside this file.
+
+**Subagent** — `booking-safety-reviewer` (`.claude/agents/`), read-only: runs the test suite and checks a diff against the invariants in this file. Use it before committing changes to `book_swim.py`. Its first run (2026-10-14) found two real gaps in the session alert.
+
+Shared rules across all of them: never a live run, never retry the reCAPTCHA-gated login form while diagnosing (failed attempts plausibly lower the server's score), never read credentials.

@@ -4,6 +4,12 @@
 Tue/Thu early-lane booking is enabled in `SCHEDULE` and in cron. Nothing is outstanding;
 what follows is what to watch and why things are the way they are.
 
+**Watch (added 2026-10-14):** the login form is now reCAPTCHA-gated and refuses this
+server, so runs log in with a saved session (CLAUDE.md, Architecture step 1). The first
+scheduled run on it is Fri 2026-10-16 07:58 (→ Sat). The 19:00 session check the evening
+before should stay silent; if either complains, `/postmortem`. The imported Remember-Me
+cookie runs to 2027-11-18 — an alert well before that means the site revoked it.
+
 ```cron
 58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
 ```

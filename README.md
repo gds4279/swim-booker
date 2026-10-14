@@ -151,6 +151,18 @@ Both name the **slot actually booked**, read back from the site rather than assu
 | `swim_booker.log` | Rolling log of all runs (pruned to 30 days) |
 | `last_run.png` | Screenshot of the final page, success or failure (removed at the start of each run) |
 | `first_failure.png` | Screenshot of the *first* failed attempt, kept intact while retries overwrite `last_run.png`. Failure emails attach both |
+| `session.json` | Saved login session (cookies) — a credential, mode 600, not committed. Created by `--import-cookies` |
+| `tests/` | Offline test suite (`.venv/bin/python -m unittest discover -s tests`) |
+| `.claude/` | Claude Code tooling — see below |
+
+## Claude Code tooling
+
+If you work on this project with Claude Code, `.claude/` sets it up:
+
+- **Guard hook** — stops Claude from making a live booking run (anything but `--dry-run`, `--check-session` or `--import-cookies`) and from reading or writing `.env` or `session.json`. It matches command text, so it sometimes blocks harmless commands that merely name those files; that's deliberate. Real runs are yours: `! ./run.sh`. Review or disable with `/hooks`.
+- **`/postmortem [date]`** — diagnoses a run: what happened, whether a lane is actually booked, why, and what to do.
+- **`/grid-check`** — checks the club's live grid against `SCHEDULE`, so a re-timed slot or retyped title is caught before 08:00. Run after 08:00; Friday/Saturday to cover the weekend grid.
+- **`booking-safety-reviewer`** — a subagent that runs the tests and reviews a change against the project's booking rules. Ask Claude to use it before committing changes to `book_swim.py`.
 
 ## Configuration
 
