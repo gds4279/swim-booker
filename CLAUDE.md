@@ -119,9 +119,12 @@ A slot whose start time will not parse is skipped, never guessed at. When `any_o
 
 ```cron
 58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
+0 19 * * 0,2,4,5 cd /home/gary/projects/swim-booker && .venv/bin/python book_swim.py --check-session --notify >/dev/null 2>&1
 ```
 
 Runs at 7:58 AM Monday, Wednesday, Friday and Saturday — each booking the *next* day: Mon→Tue, Wed→Thu, Fri→Sat, Sat→Sun. Edit with `crontab -e`.
+
+The second line is the session health check, at 7 PM the evening **before** each run day (Sun, Tue, Thu, Fri), so an expired login is reported while there is still time to re-import it. Silent when the session is live. When the site sends it to `/login` it posts to Slack and emails `NOTIFY_EMAIL` only (no CC — they can't act on it) with the re-import steps; when the site is merely unreachable it posts a milder Slack note and no email, so an evening outage doesn't send anyone to re-export cookies. The alert text is built by `session_alert()` and `next_run()`, both pure and tested. `CRON_RUN_DAYS` mirrors the booking cron line; a test checks it against `SCHEDULE`.
 
 The cron day numbers and the `SCHEDULE` keys are the same digits (1, 3, 5, 6), which is a coincidence worth understanding before changing either: cron numbering is Python's `weekday()` plus one, and the day booked is always the day after the run, so the two offsets cancel. Change one and you must re-derive the other rather than copying it.
 
@@ -167,6 +170,8 @@ Both email and Slack are sent on every run (success and failure).
 `attachment_path` takes either one `Path` or several; missing files are skipped and duplicates attached once. Success mails carry `last_run.png`; failure mails carry `first_failure.png` **and** `last_run.png`, labelled with which attempt each came from. A success reached without a wizard confirmation adds a `NOTE:` line to the body saying how it was confirmed instead — the mail should never imply the wizard said something it did not.
 
 **Testing note:** `send_email()` talks to real Gmail and swallows its own errors, so a test that calls it delivers actual mail rather than failing loudly. Stub `smtplib.SMTP` before exercising it.
+
+**Tests:** `.venv/bin/python -m unittest discover -s tests` (stdlib, ~0.5s, no network). `tests/test_book_swim.py` sets dummy values for every credential the code reads *before* importing (`load_dotenv` never overrides an existing variable, so the real ones are never used), stubs SMTP and HTTP to raise, and disables logging so nothing lands in `swim_booker.log`. It covers the pure functions and runs the real `_FIND_EVENT_JS` against hand-built pages in a local Chromium. Cases are named after the incidents that made each rule; add one with every fix. The `booking-safety-reviewer` subagent (`.claude/agents/`) runs this suite and checks a diff against the invariants in this file — use it before committing changes to `book_swim.py`.
 
 **Slack** — posts to the `#swim-booker` channel via an Incoming Webhook. The webhook URL is stored in `.env` as `SLACK_WEBHOOK_URL`. Uses only stdlib (`json` + `urllib.request`) — no additional dependency. Skipped silently if `SLACK_WEBHOOK_URL` is unset. The success message shows the **actual booked slot**, not the target time — e.g. `Swim lane booked! Saturday, June 20 3:30pm - 4:25pm`.
 

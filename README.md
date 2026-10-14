@@ -116,9 +116,20 @@ The cron schedule (`crontab -e`) is:
 
 ```
 58 7 * * 1,3,5,6 /home/gary/projects/swim-booker/run.sh
+0 19 * * 0,2,4,5 cd /home/gary/projects/swim-booker && .venv/bin/python book_swim.py --check-session --notify >/dev/null 2>&1
 ```
 
-This runs at 7:58 AM on Monday (books Tuesday), Wednesday (books Thursday), Friday (books Saturday) and Saturday (books Sunday). `run.sh` activates the `.venv` and launches the script immediately — it needs to be *running* before 8:00, not started at 8:00. `book_swim.py` handles the precise timing itself, holding until 08:00:00 before it clicks Register.
+The first line runs at 7:58 AM on Monday (books Tuesday), Wednesday (books Thursday), Friday (books Saturday) and Saturday (books Sunday). `run.sh` activates the `.venv` and launches the script immediately — it needs to be *running* before 8:00, not started at 8:00. `book_swim.py` handles the precise timing itself, holding until 08:00:00 before it clicks Register.
+
+The second line checks the saved login at 7 PM the evening before each run. It is silent when all is well. If the login has expired you get a Slack message and an email with the steps to refresh it (see *Saved login session*); if the site was just unreachable, a Slack note only.
+
+### Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+Offline (no login, nothing booked or sent), about half a second.
 
 ## Notifications
 

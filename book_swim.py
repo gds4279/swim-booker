@@ -124,11 +124,13 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def send_email(subject: str, body: str,
-               attachment_path: Path | Iterable[Path] | None = None) -> None:
+               attachment_path: Path | Iterable[Path] | None = None,
+               cc: str | None = CC_EMAIL) -> None:
     msg = MIMEMultipart()
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
-    msg["Cc"] = CC_EMAIL
+    if cc:
+        msg["Cc"] = cc
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
@@ -152,7 +154,7 @@ def send_email(subject: str, body: str,
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_APP_PASSWORD)
-            server.sendmail(SMTP_USER, [NOTIFY_EMAIL, CC_EMAIL], msg.as_string())
+            server.sendmail(SMTP_USER, [NOTIFY_EMAIL] + ([cc] if cc else []), msg.as_string())
         log.info("Email sent: %s", subject)
     except Exception:
         log.error("Failed to send email:\n%s", traceback.format_exc())
@@ -1254,22 +1256,97 @@ def schedule_for(target_date: date, probe: bool = False) -> DaySchedule | None:
     return SCHEDULE.get(target_date.weekday())
 
 
-def check_session() -> bool:
-    """Report whether the saved session is logged in. Books nothing, notifies no one."""
+CRON_RUN_DAYS = (0, 2, 4, 5)   # Mon, Wed, Fri, Sat - mirrors `58 7 * * 1,3,5,6`
+
+
+def next_run(now: datetime) -> datetime:
+    """When cron next starts a booking run (07:58 on CRON_RUN_DAYS). Pure."""
+    day = now.date()
+    for _ in range(8):
+        start = datetime.combine(day, time_of_day(7, 58))
+        if day.weekday() in CRON_RUN_DAYS and start > now:
+            return start
+        day += timedelta(days=1)
+    raise AssertionError("CRON_RUN_DAYS is empty")
+
+
+def session_alert(status: str, now: datetime) -> tuple[str, str] | None:
+    """(slack, email-or-"") for a --check-session --notify result; None when all is well.
+
+    "dead" means the site sent us to /login: the user must act before the next run.
+    "unknown" means we could not reach the site - say so, but don't send anyone off
+    to re-export cookies over a passing outage. Pure.
+    """
+    if status == "live":
+        return None
+    run = next_run(now)
+    when = run.strftime("%A %-I:%M %p")
+    if status == "unknown":
+        return (f":grey_question: Swim booker could not check its saved login (site unreachable?). "
+                f"Next run {when}. If this repeats, run `python3 book_swim.py --check-session`.", "")
+    steps = ("1. In your browser, log in at mytrilogylife.com with Remember Me ticked.\n"
+             "2. Export the members.mytrilogylife.com cookies (Cookie-Editor → Export → JSON).\n"
+             "3. On the server:  python3 book_swim.py --import-cookies cookies.json && rm cookies.json")
+    return (f":warning: *Swim booker: saved login has expired.* The next run ({when}) will fail "
+            f"unless it is refreshed.\n{steps}",
+            f"The swim booker's saved login is no longer valid, so the next run ({when}) "
+            f"will fail at the site's bot check.\n\nTo refresh it:\n{steps}\n")
+
+
+def session_status(live: bool, url: str, login_form_shown: bool) -> str:
+    """Classify a session check as "live", "dead" or "unknown". Pure.
+
+    Dead is any sign the site wants a login - the /login redirect (verified
+    2026-10-14) or a login form on whatever page we landed on - so an expired
+    session never gets mistaken for an outage and downgraded to a mild alert.
+    """
+    if live:
+        return "live"
+    if "/login" in url or login_form_shown:
+        return "dead"
+    return "unknown"
+
+
+def check_session(notify: bool = False) -> bool:
+    """Report whether the saved session is logged in. Books nothing.
+
+    With `notify` (the cron health check), a dead or uncheckable session is reported
+    on Slack, and a dead one also by email to NOTIFY_EMAIL only - not the CC, who
+    can't act on it. A live session is silent.
+    """
+    status = "dead"
     if load_session() is None:
         log.error("No usable saved session at %s", SESSION_FILE)
-        return False
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=load_session())
-        live = session_is_live(context.new_page())
-        if live:
-            save_session(context)
+    else:
+        # Anything that goes wrong here must still reach the alert below: under cron
+        # stdout/stderr go nowhere, so an uncaught error would be a silent failure.
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(storage_state=load_session())
+                page = context.new_page()
+                live = session_is_live(page)
+                status = session_status(live, page.url,
+                                        not live and page.locator('input[type="password"]').count() > 0)
+                if status == "live":
+                    save_session(context)
+                browser.close()
+        except Exception:
+            status = "unknown"
+            log.error("Session check crashed:\n%s", traceback.format_exc())
+        if status == "live":
             log.info("Saved session is logged in – runs will skip the login form")
-        else:
+        elif status == "dead":
             log.error("Saved session is NOT logged in – export fresh cookies and re-import")
-        browser.close()
-    return live
+        else:
+            log.error("Could not check the saved session – site unreachable?")
+    alert = session_alert(status, datetime.now()) if notify else None
+    if alert:
+        slack, email = alert
+        send_slack(slack)
+        if email:
+            send_email("[Swim Booker] ACTION NEEDED – saved login expired", email, cc=None)
+    return status == "live"
 
 
 def import_cookies(path: str) -> bool:
@@ -1287,7 +1364,7 @@ def main() -> None:
             sys.exit("usage: book_swim.py --import-cookies <cookie-export-file>")
         sys.exit(0 if import_cookies(sys.argv[i + 1]) else 1)
     if "--check-session" in sys.argv:
-        sys.exit(0 if check_session() else 1)
+        sys.exit(0 if check_session(notify="--notify" in sys.argv) else 1)
 
     dry_run = "--dry-run" in sys.argv
     target_date = date.today() + timedelta(days=1)
