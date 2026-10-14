@@ -26,3 +26,6 @@ swim_booker.log
 # Saved login session (a credential)
 session.json
 session.tmp
+
+# Personal Claude Code permission rules
+.claude/settings.local.json
