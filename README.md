@@ -56,12 +56,19 @@ python3 book_swim.py --dry-run
 
 Logs in, opens the wizard far enough to read the slot grid, prints it along with what the current config *would* book, and exits without selecting anything. It sends no notifications. Start it before 07:58 and it goes through the full opening-bell hold — the only way to see a grid before the day sells out.
 
-If tomorrow is already booked, the dry run reports the slot you hold and stops there rather than reading a grid — the site stops offering a member row once you have a ticket:
+If tomorrow is already booked, the booking wizard is closed to you, so the dry run reads the grid from the event page's ticket list instead. The verdict then ignores availability (most slots will be sold out by then) and only answers whether the configured times still exist:
 
 ```
-On event detail page: https://members.mytrilogylife.com/events/1849593
 Already registered for 6:00am-6:40am Indoor Pool – not re-entering the wizard
+...
+Slots on the event page (already booked – availability is as of now, not 08:00):
+   OPEN   6:00am-6:40am Indoor Pool
+   taken  7:30am-8:10am Indoor Pool
+   ...
+Would book at 08:00 (if all open): 6:00am-6:40am   (matched preference 6:00 AM)
 ```
+
+`/grid-check` in Claude Code runs this and interprets it.
 
 ## Setup
 

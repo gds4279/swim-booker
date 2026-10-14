@@ -472,22 +472,58 @@ def choose_slot(options: list[dict], preferences: list[str], avoid: set[str],
     return None, None, None
 
 
+_TICKET_ROW_RE = re.compile(r"^[ \t]*(\S[^\n]*?)[ \t]*\n[ \t]*\$[\d.,]+[ \t]*(?:\(([^)\n]*)\))?", re.M)
+
+
+def parse_ticket_prices(page_text: str) -> list[dict]:
+    """The event page's "Ticket Prices" list, as dropdown-style options.
+
+    The page lists the whole grid as pairs of lines - `6:00am-6:40am Indoor Pool`
+    then `$0.00 (Sold Out)` or `$0.00 (2 Tickets Left)` - even once Gary holds a
+    ticket, when the wizard no longer offers him a dropdown (verified 2026-10-14).
+    That makes it the only way --dry-run can see a grid on a day already booked.
+    Pure, so it can be tested offline. Values are synthetic: never submit them.
+    """
+    start = page_text.find("Ticket Prices")
+    if start < 0:
+        return []
+    section = page_text[start + len("Ticket Prices"):]
+    end = section.find("Date and time")
+    if end >= 0:
+        section = section[:end]
+    return [{"value": f"grid-{n}", "text": m.group(1).strip(),
+             "disabled": "sold out" in (m.group(2) or "").lower()}
+            for n, m in enumerate(_TICKET_ROW_RE.finditer(section), 1)]
+
+
 def report_slots(options: list[dict], target_date: date, preferences: list[str],
-                 any_open: bool, latest: time_of_day | None = None) -> None:
+                 any_open: bool, latest: time_of_day | None = None,
+                 from_event_page: bool = False) -> None:
     """Print the real slot grid and what the current config would do with it.
 
     Used by --dry-run to validate a schedule against the live site before any
-    booking is attempted.
+    booking is attempted. `from_event_page` means the grid was read after the day
+    was booked, so availability says nothing about 08:00: the verdict then ignores
+    it and answers only "do the configured times and labels still exist?".
     """
     lines = ["", "=" * 62,
              f"DRY RUN – nothing was booked",
              f"Target: {target_date.strftime('%A, %B %-d, %Y')}",
-             "=" * 62, "", "Slots offered to Gary:"]
+             "=" * 62, ""]
+    lines.append("Slots on the event page (already booked – availability is as of now, "
+                 "not 08:00):" if from_event_page else "Slots offered to Gary:")
     for o in options:
         if not o["value"] or o["value"] == "0":
             continue
-        note = "" if is_lane(o["text"]) else "   (not a lap lane – never booked)"
+        if not is_lane(o["text"]):
+            note = "   (not a lap lane – never booked)"
+        elif slot_start(o["text"]) is None:
+            note = "   (start time unreadable – never booked as a fallback)"
+        else:
+            note = ""
         lines.append(f"   {'OPEN ' if not o['disabled'] else 'taken'}  {o['text']}{note}")
+    if from_event_page:
+        options = [dict(o, disabled=False) for o in options]
 
     want = " → ".join(preferences) if preferences else "(none configured)"
     if not any_open:
@@ -503,12 +539,13 @@ def report_slots(options: list[dict], target_date: date, preferences: list[str],
 
     value, text, matched = choose_slot(options, preferences, set(),
                                        any_open=any_open, latest=latest)
+    verdict = "Would book at 08:00 (if all open)" if from_event_page else "Would book"
     if value is None:
-        lines.append("Would book: NOTHING — no acceptable slot"
+        lines.append(f"{verdict}: NOTHING — no acceptable slot"
                      + ("" if any_open else " (fallback disabled for this day)"))
     else:
         how = f"matched preference {matched}" if matched else "fallback to earliest acceptable lane"
-        lines.append(f"Would book: {text.split(' Indoor')[0].strip()}   ({how})")
+        lines.append(f"{verdict}: {text.split(' Indoor')[0].strip()}   ({how})")
     lines += ["=" * 62, ""]
     log.info("\n".join(lines))
 
@@ -871,6 +908,17 @@ def book_once(preferences: list[str], avoid: set[str] | None = None,
         if held:
             log.info("Already registered for %s – not re-entering the wizard", held)
             if dry_run:
+                # The wizard is closed to a held ticket, but the event page still
+                # lists the grid - read it so recon works on booked days too.
+                try:
+                    grid = parse_ticket_prices(page.inner_text("body"))
+                except Exception:
+                    grid = []
+                if grid:
+                    report_slots(grid, target_date, preferences, any_open, latest,
+                                 from_event_page=True)
+                else:
+                    log.warning("No ticket list found on the event page – grid not checked")
                 browser.close()
                 return
             capture(page)
